@@ -31,12 +31,8 @@ class InstanceToSemantic(object):
                     # we need to double check that all rles are the correct size
                     # Otherwise cocotools will fail silently to an empty [0,0] mask
                     for seg in all_segs:
-                        # pyre-fixme[16]: Item `None` of `None | dict[Any, Any] |
-                        #  Tensor` has no attribute `__getitem__`.
                         assert seg["size"] == all_segs[0]["size"], (
                             "Instance segments have inconsistent sizes. "
-                            # pyre-fixme[16]: Item `None` of `None | dict[Any, Any]
-                            #  | Tensor` has no attribute `__getitem__`.
                             f"Found sizes {seg['size']} and {all_segs[0]['size']}"
                         )
                     fquery.semantic_target = mask_utils.merge(all_segs)
@@ -58,7 +54,6 @@ class InstanceToSemantic(object):
                             isinstance(segment, torch.Tensor)
                             and segment.dtype == torch.uint8
                         )
-                        # pyre-fixme[16]: Optional type has no attribute `__ior__`.
                         fquery.semantic_target |= segment
 
         if self.delete_instance:
@@ -79,8 +74,6 @@ class RecomputeBoxesFromMasks:
                 # Note: if the mask is empty, the bounding box will be undefined
                 # The empty targets should be subsequently filtered
                 obj.bbox = masks_to_boxes(obj.segment)
-                # pyre-fixme[16]: Item `None` of `None | dict[Any, Any] | Tensor`
-                #  has no attribute `sum`.
                 obj.area = obj.segment.sum().item()
 
         return datapoint
@@ -121,7 +114,6 @@ class DecodeRle:
                         # segment is uint8 and remains uint8 throughout the transforms
                         obj.segment = torch.tensor(obj.segment).to(torch.uint8)
 
-                    # pyre-fixme[16]: `dict` has no attribute `shape`.
                     if list(obj.segment.shape) != [img_h, img_w]:
                         # Should not happen often, but adding for security
                         if not warning_shown:
@@ -132,12 +124,7 @@ class DecodeRle:
                             warning_shown = True
 
                         obj.segment = F.resize(
-                            # pyre-fixme[6]: For 2nd argument expected `List[int]`
-                            #  but got `Tuple[int, int]`.
-                            obj.segment[None],
-                            # pyre-fixme[6]: For 2nd argument expected `List[int]`
-                            #  but got `Tuple[int, int]`.
-                            (img_h, img_w),
+                            obj.segment[None], (img_h, img_w)
                         ).squeeze(0)
 
                     assert list(obj.segment.shape) == [img_h, img_w]
@@ -161,10 +148,7 @@ class DecodeRle:
                         warning_shown = True
 
                     query.semantic_target = F.resize(
-                        # pyrefly: ignore [bad-argument-type]
-                        query.semantic_target[None],
-                        # pyrefly: ignore [bad-argument-type]
-                        imgId2size[query.image_id],
+                        query.semantic_target[None], imgId2size[query.image_id]
                     ).squeeze(0)
 
                 assert tuple(query.semantic_target.shape) == imgId2size[query.image_id]

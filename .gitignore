@@ -155,3 +155,6 @@ Thumbs.db
 # Local data & weights (symlinks / large files)
 /data/
 /pretrained_weights/
+
+
+/outputs/

@@ -32,14 +32,12 @@ class TorchDataset:
         if enable_distributed_sampler:
             self.sampler = DistributedSampler(self.dataset, shuffle=self.shuffle)
         else:
-            # pyrefly: ignore [bad-assignment]
             self.sampler = None
 
     def get_loader(self, epoch) -> Iterable:
         if self.sampler:
             self.sampler.set_epoch(epoch)
         if hasattr(self.dataset, "epoch"):
-            # pyrefly: ignore [missing-attribute]
             self.dataset.epoch = epoch
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)

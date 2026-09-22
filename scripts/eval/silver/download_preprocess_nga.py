@@ -10,8 +10,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-
-# pyrefly: ignore [missing-import]
 import utils
 from PIL import Image
 from tqdm import tqdm
@@ -54,7 +52,7 @@ def download_item(item, output_folder):
         if response.status_code == 200:
             with open(output_folder / f"{uuid}{EXTENSION}", "wb") as f:
                 f.write(response.content)
-    except Exception:
+    except:
         print("errored", item)
         return
 

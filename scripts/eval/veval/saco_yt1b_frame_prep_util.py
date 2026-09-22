@@ -7,8 +7,6 @@ import os
 import subprocess
 
 import pandas as pd
-
-# pyrefly: ignore [missing-source-for-stubs]
 import yt_dlp
 
 logger = logging.getLogger(__name__)

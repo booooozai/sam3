@@ -6,7 +6,6 @@ import logging
 import torch
 
 try:
-    # pyrefly: ignore [missing-import]
     from cc_torch import get_connected_components
 
     HAS_CC_TORCH = True

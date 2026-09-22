@@ -22,7 +22,6 @@ from sam3.train.utils import distributed as dist
 from typing_extensions import override
 
 try:
-    # pyrefly: ignore [missing-import]
     import rapidjson as json
 except ModuleNotFoundError:
     import json

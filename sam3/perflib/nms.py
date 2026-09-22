@@ -10,7 +10,6 @@ from sam3.perflib.masks_ops import mask_iou
 
 
 try:
-    # pyrefly: ignore [missing-import]
     from torch_generic_nms import generic_nms as generic_nms_cuda
 
     GENERIC_NMS_AVAILABLE = True

@@ -36,7 +36,6 @@ def sample_box_points(
     ).repeat(B)
     if noise > 0.0:
         if not isinstance(noise_bound, torch.Tensor):
-            # pyrefly: ignore [bad-assignment]
             noise_bound = torch.tensor(noise_bound, device=device)
         bbox_w = box_coords[..., 2] - box_coords[..., 0]
         bbox_h = box_coords[..., 3] - box_coords[..., 1]
@@ -53,7 +52,6 @@ def sample_box_points(
 
     box_coords = box_coords.reshape(-1, 2, 2)  # always 2 points
     box_labels = box_labels.reshape(-1, 2)
-    # pyrefly: ignore [bad-return]
     return box_coords, box_labels
 
 
@@ -369,17 +367,7 @@ def get_best_gt_match_from_multimasks(pred_multimasks, gt_masks, pred_scores=Non
     return best_pred_mask
 
 
-def fill_holes_in_mask_scores(
-    mask,
-    max_area=None,
-    fill_holes=True,
-    remove_sprinkles=True,
-    fill_hole_area=None,
-    sprinkle_removal_area=None,
-):
-    # Support onevision-style keyword args
-    if fill_hole_area is not None and max_area is None:
-        max_area = fill_hole_area
+def fill_holes_in_mask_scores(mask, max_area, fill_holes=True, remove_sprinkles=True):
     """
     A post processor to fill small holes in mask scores with area under `max_area`.
     Holes are those small connected components in either background or foreground.
