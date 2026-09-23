@@ -147,8 +147,28 @@ class COCO_FROM_JSON:
             )
 
     def getDatapointIds(self):
-        """Return all datapoint indices for training."""
-        return list(range(len(self._raw_data) * len(self.category_chunks)))
+        """Return datapoints that can produce at least one find query.
+
+        When negative queries are disabled, images without annotations (or a
+        category chunk without any annotation) would otherwise produce an
+        empty datapoint.  ``Sam3ImageDataset`` rejects those datapoints with
+        ``No find queries``.  Filter them here so the dataset does not sample
+        known-invalid indices.
+        """
+        if self.include_negatives:
+            return list(range(len(self._raw_data) * len(self.category_chunks)))
+
+        datapoint_ids = []
+        for image_idx, record in enumerate(self._raw_data):
+            annotated_categories = {
+                annotation["category_id"] for annotation in record["annotations"]
+            }
+            for chunk_idx, category_chunk in enumerate(self.category_chunks):
+                if annotated_categories.intersection(category_chunk):
+                    datapoint_ids.append(
+                        image_idx * len(self.category_chunks) + chunk_idx
+                    )
+        return datapoint_ids
 
     def loadQueriesAndAnnotationsFromDatapoint(self, idx):
         """
@@ -163,6 +183,11 @@ class COCO_FROM_JSON:
         img_idx = idx // len(self.category_chunks)
         chunk_idx = idx % len(self.category_chunks)
         cat_chunk = self.category_chunks[chunk_idx]
+
+        return self._load_queries_and_annotations_for_categories(img_idx, cat_chunk)
+
+    def _load_queries_and_annotations_for_categories(self, img_idx, category_ids):
+        """Build find queries and targets for selected categories of one image."""
 
         queries = []
         annotations = []
@@ -202,7 +227,7 @@ class COCO_FROM_JSON:
             cat_id_to_anns[ann["category_id"]].append(ann)
 
         annotations_by_cat_sorted = [
-            (cat_id, cat_id_to_anns[cat_id]) for cat_id in cat_chunk
+            (cat_id, cat_id_to_anns[cat_id]) for cat_id in category_ids
         ]
 
         for cat_id, anns in annotations_by_cat_sorted:
@@ -263,6 +288,10 @@ class COCO_FROM_JSON:
             List containing image info dict
         """
         img_idx = idx // len(self.category_chunks)
+        return self._load_image_from_image_index(img_idx)
+
+    def _load_image_from_image_index(self, img_idx):
+        """Build the image metadata entry for a raw image index."""
         img_data = self._raw_data[img_idx]["image"]
         images = [
             {
@@ -273,6 +302,65 @@ class COCO_FROM_JSON:
             }
         ]
         return images
+
+
+class COCOPositivePairFromJSON(COCO_FROM_JSON):
+    """Expose each positive image-category pair as one dataset record.
+
+    An image containing multiple annotated categories appears once per distinct
+    positive category. All instances of that category remain grouped under one
+    find query. The index is built directly from annotations, so its size scales
+    with the number of positive image-category pairs rather than the Cartesian
+    product of images and the category vocabulary.
+
+    This loader intentionally does not expose ``include_negatives`` or
+    ``category_chunk_size``. It is the positive-pair data contract used by the
+    SteerSAM image training pipeline.
+    """
+
+    def __init__(self, annotation_file, prompts=None):
+        super().__init__(
+            annotation_file=annotation_file,
+            prompts=prompts,
+            include_negatives=False,
+            category_chunk_size=None,
+        )
+
+        known_categories = set(self._cat_idx_to_text)
+        self._positive_pairs = []
+        for image_idx, record in enumerate(self._raw_data):
+            annotated_categories = {
+                annotation["category_id"] for annotation in record["annotations"]
+            }
+            unknown_categories = annotated_categories - known_categories
+            if unknown_categories:
+                raise ValueError(
+                    "Annotations reference categories missing from the category "
+                    f"table: {sorted(unknown_categories)}"
+                )
+            self._positive_pairs.extend(
+                (image_idx, category_id) for category_id in sorted(annotated_categories)
+            )
+
+    def getDatapointIds(self):
+        """Return contiguous ids for all positive image-category pairs."""
+        return range(len(self._positive_pairs))
+
+    def loadQueriesAndAnnotationsFromDatapoint(self, idx):
+        image_idx, category_id = self._positive_pairs[idx]
+        queries, annotations = self._load_queries_and_annotations_for_categories(
+            image_idx, [category_id]
+        )
+        if len(queries) != 1 or len(annotations) == 0:
+            raise RuntimeError(
+                "A positive-pair record must contain exactly one query and at "
+                "least one annotation."
+            )
+        return queries, annotations
+
+    def loadImagesFromDatapoint(self, idx):
+        image_idx, _ = self._positive_pairs[idx]
+        return self._load_image_from_image_index(image_idx)
 
 
 # ============================================================================

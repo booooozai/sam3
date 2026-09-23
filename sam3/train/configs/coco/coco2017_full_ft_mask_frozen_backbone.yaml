@@ -12,13 +12,15 @@ defaults:
 # to the (now frozen) vision trunk.
 # ============================================================================
 paths:
-  coco_root: /home/chenshengbo/workspace/sam3/data/coco_mini
+  coco_root: /home/chenshengbo/workspace/sam3/data/coco
   experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/coco2017_full_ft_mask_frozen_backbone
   bpe_path: /home/chenshengbo/workspace/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
   checkpoint_path: /home/chenshengbo/workspace/sam3/pretrained_weights/sam3/sam3.pt
 # COCO 2017 dataset configuration
 coco_train:
-  num_images: null # null uses the complete COCO train2017 split.
+  # Kept for CLI compatibility. With the positive-pair loader, a non-null
+  # value limits pair records rather than distinct source images.
+  num_images: null # null uses all positive pairs in the COCO train2017 split.
 
   # Training transforms pipeline
   train_transforms:
@@ -203,7 +205,7 @@ scratch:
   scheduler_warmup: 20
   scheduler_cooldown: 20
 
-  val_batch_size: 1
+  val_batch_size: 72
   collate_fn_val:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -212,7 +214,7 @@ scratch:
     with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
 
   gradient_accumulation_steps: 1
-  train_batch_size: 1
+  train_batch_size: 72
   collate_fn:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -253,9 +255,7 @@ trainer:
         _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
         limit_ids: ${coco_train.num_images}
         coco_json_loader:
-          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
-          include_negatives: true
-          category_chunk_size: 80 # Mask training uses more memory than bbox-only training.
+          _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
           _partial_: true
         transforms: ${coco_train.train_transforms}
         load_segmentation: ${scratch.enable_segmentation}
@@ -281,9 +281,7 @@ trainer:
         _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
         load_segmentation: ${scratch.enable_segmentation}
         coco_json_loader:
-          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
-          include_negatives: true
-          category_chunk_size: 80
+          _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
           _partial_: true
         img_folder: ${paths.coco_root}/val2017
         ann_file: ${paths.coco_root}/annotations/instances_val2017.json

@@ -1,9 +1,9 @@
 # 从 SteerViT 到 SteerSAM：架构分析与实现指南
 
-> 文档状态：设计提案（尚未实现 SteerSAM）
+> 文档状态：设计提案（positive-pair data loader 已实现，SteerSAM 模型尚未实现）
 > 适用范围：当前仓库的 SAM3 **图像模型（image pipeline）**与 COCO 微调流程；不包含 video pipeline
 > 源码基线：本文以本地 `sam3/` 和 `SteerViT/` 源码为准；论文用于解释设计动机和交叉验证
-> 最后核对日期：2026-09-23
+> 最后核对日期：2026-09-24（已包含提交 `299429c` 的 COCO 空 query 过滤语义）
 
 ## 1. 目标与结论先行
 
@@ -22,7 +22,7 @@
 - adapter 中视觉 token 是 query，文本 token 是 key/value；
 - SAM3 原有的 `resizer: 1024 -> 256`、fusion encoder、decoder 和 mask head 全部保留；
 - 冻结两个预训练 backbone 的原有参数，只训练新 adapter、gate 以及当前任务相关的非 backbone 模块；
-- 第一版 COCO 训练采用 `category_chunk_size=1`，使一条样本记录只包含一个文本提示；物理 batch size 按显存选择，较大的 effective batch 优先通过梯度累积实现。
+- SteerSAM image data pipeline 使用专用的 `COCOPositivePairFromJSON`，直接从标注构建正 `(image, category)` pair；它不暴露 `include_negatives` 或 `category_chunk_size`，从数据合约上保证每条 record 只有一个正 prompt。物理 batch size 按显存选择，较大的 effective batch 优先通过梯度累积实现。
 
 这不是无风险的“必然增强”。SteerViT 的实验证据说明 early language steering 对细粒度、指称性视觉特征有价值，但 SAM3 已经有很强的 late fusion 和 prompt-grounding 能力。SteerSAM 是否提高 COCO 检测/分割指标，必须通过严格消融实验验证。
 
@@ -262,7 +262,23 @@ text_ids:        P                      # pair -> unique-text row
 
 [sam3/model/sam3_image.py](../sam3/model/sam3_image.py) 先对每张唯一图像只运行一次 backbone，然后用 `img_ids` 选择/复用视觉特征；文本也通过 `text_ids` 选择。这对 late fusion 很高效，因为图像特征与 prompt 无关。
 
-现有冻结 backbone 配置 [coco2017_full_ft_mask_frozen_backbone.yaml](../sam3/train/configs/coco/coco2017_full_ft_mask_frozen_backbone.yaml) 中，训练和验证的 `category_chunk_size` 都是 `80`。这意味着一个图像记录可以产生多条类别 query。SteerSAM 若让视觉 backbone 感知文本，同一张图在不同 query 下就应产生不同特征，不能再把一次 backbone 输出无条件复制给 80 条 prompt。第 6.5 节给出 COCO 第一版的处理边界。
+当前冻结 backbone 配置 [coco2017_full_ft_mask_frozen_backbone.yaml](../sam3/train/configs/coco/coco2017_full_ft_mask_frozen_backbone.yaml) 已切换为：
+
+```yaml
+coco_json_loader:
+  _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
+  _partial_: true
+```
+
+loader 会扫描标注，为每个实际存在的 `(image_idx, category_id)` 建立一条索引。例如一张图同时含有猫、狗和人，数据集中对应三条 record：`(图, 猫)`、`(图, 狗)`、`(图, 人)`。同一类别的多个 instance 仍集合在该 pair 的同一条 query/target 中，不会再按 instance 拆分。
+
+因此，数据集长度为：
+
+```text
+N_pairs = sum_i K_i
+```
+
+其中 `K_i` 是第 `i` 张图中不同正类别的数量，而不是实例数。这避免了通用 `COCO_FROM_JSON` 的 category chunk 概念混入 SteerSAM 的一对一合约。在当前 late-fusion baseline 中，这种拆分会放弃“同一图像的多个 prompt 共享一次视觉编码”的优化；但它正好为后续 prompt-conditioned vision backbone 提供明确的一对一输入。
 
 这是从 late fusion 迁移到 early steering 时最大的系统级差异。
 
@@ -446,7 +462,7 @@ contextual 1024 tokens
 
 这样做不会重复运行 text encoder，也不会用 256 维结果逆投影回 1024。第一版不增加 connector；如果实验显示需要额外对齐，可加入可训练的 `1024 -> 1024` projection 或 bottleneck MLP 作为独立消融，但不应默认引入。
 
-### 6.5 `category_chunk_size=1` 与图文 pair batch 合约
+### 6.5 Positive-pair loader 与图文一对一合约
 
 early steering 要求每条视觉特征与一条 prompt 一一对应：
 
@@ -458,32 +474,50 @@ pair 1 -> image A + "bicycle"  # 必须得到另一份 backbone 输出
 pair 2 -> image B + "dog"
 ```
 
-对于当前 COCO loader，第一版推荐把 `category_chunk_size` 设为 `1`。它使一条 dataset record 只产生一个类别 prompt，因此在没有其他 query 扩增的情况下，DataLoader 的一个样本对应一个 image-prompt pair，batch 中通常满足 `P = B_I = batch_size`。这是解决当前 COCO 一图多 prompt 语义冲突的最简单方法。
+对于 SteerSAM image pipeline，默认数据合约由专用 loader 表达：
 
-但它与“把 `category_chunk_size` 从 80 改成 1，再把物理 batch size 放大 80 倍”不是同一件事，也没有必要这样做：
+```yaml
+coco_json_loader:
+  _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
+  _partial_: true
+```
 
-- 原设置只运行一份 image backbone，再让 80 条 prompt 复用视觉特征；
-- SteerSAM 中 80 条 prompt 需要 80 份 prompt-conditioned image backbone 计算；
-- `category_chunk_size=1` 会把同一源图像的不同类别变成不同 dataset records，数据集长度、采样顺序、正负样本组成和 epoch 语义都会变化；
-- 不同 record 还可能得到不同随机增强，所以不严格等价于原先同一增强图像上的 80 条 query；
-- 物理 batch size 必须由显存决定；若需要较大的 effective batch，优先使用 gradient accumulation。
+`COCOPositivePairFromJSON` 不暴露 `include_negatives` 和 `category_chunk_size`，因此不存在忘记将某个参数设为 `false` 或 `1` 而破坏 pair 语义的情况。它直接从 annotation 表建立**正 image-category pair 数据集**，不枚举无标注类别，也不构建 `image_count x category_count` 的中间索引。在当前每条 record 仅含一张图和一条 query 的前提下，一个 DataLoader batch 满足：
 
-因此，本方案的准确结论是：`category_chunk_size=1` 解决 COCO v1 的 pair 语义问题；增大 batch size 只是可选的吞吐/优化选择，不是正确性的必要条件，也不能无代价恢复原训练方式。
+```text
+P = number_of_image_rows = physical_batch_size
+img_ids = [0, 1, ..., P-1]
+```
 
-更通用的模型代码仍应能根据 `img_ids/text_ids` 构造 pair batch：
+注意：这里的 image rows 不等于“去重后的源 COCO image id 数量”。同一张源图的不同正类别是不同 records，collator 会将它们作为独立 image rows 堆叠，它们也可能经过不同的随机增强。`find_text_batch` 仍会按文本字符串去重，所以去重文本数 `U` 可以小于 `P`，但 `text_ids` 会为每个 pair 指向正确的文本行。
+
+与一条 image record 同时包含 `K_i` 个正类别的通用 loader 用法相比，变化是：
+
+- 一条 record 只有一个正 prompt，从数据层就满足 prompt-conditioned backbone 的一对一要求；
+- 数据集长度从“有效图像记录数”变为“正 image-category pair 总数”，扩大倍数与每张图的正类别数有关，不是固定 80 倍；
+- 同一源图像的不同 records 可能接受不同随机增强，因此不严格等价于在同一增强图像上联合处理全部正类别；
+- 物理 batch size 只决定每步处理多少个 pair；它是显存和吞吐的超参数，不是 pair 语义的正确性开关；
+- 若显存不足，应降低物理 batch size，并通过 gradient accumulation 恢复目标 effective batch。
+
+因此，pair 拆分由 loader 的索引方式解决；增大 batch size 不是正确性的必要条件，也不能恢复原先的共享视觉计算或完全相同的采样过程。frozen-backbone YAML 中的 train/val physical batch size 只是 baseline 的吞吐调优参数；接入 SteerSAM adapter 后必须重新测量，不应盲目继承。
+
+专用 loader 将 positive-only 行为固化为默认且唯一的语义。它的数据集规模跟随实际标注的正 image-category pairs，而不是 `N_images x C` 笛卡尔积，因而更适合扩展到 LVIS 等大词表数据集。通用 `COCO_FROM_JSON` 的既有默认行为保持不变，避免影响其他 SAM3 数据配置。
+
+因此，当前 SteerSAM 设计、训练配置、测试和实验方案统一按 positive-only 数据处理，不增加其他类别组合分支。
+
+对于当前 positive-pair loader，模型不需要通过 `images[img_ids]` 再复制一份 pair images；`img_batch` 本身已经是 pair batch。仅文本需要从 `U` 条去重结果 gather 到 `P` 条 pair：
 
 ```python
-pair_images = images[img_ids]                  # P x 3 x 672 x 672
+assert torch.equal(img_ids, torch.arange(P, device=img_ids.device))
+pair_images = images                           # P x 3 x 672 x 672
 pair_text_1024 = text_1024[:, text_ids]        # L x P x 1024
 pair_text_256 = text_256[:, text_ids]          # L x P x 256
 pair_padding_mask = padding_mask[text_ids]     # P x L
 ```
 
-然后下游把 pair 当成新的 batch，索引重置为 `arange(P)`。即使分辨率降为 672，若 `P=80*B_I`，视觉主干的计算和显存仍会急剧增长。因此应增加 `max_steering_pairs_per_forward` 保护；超过上限时显式报错或由训练循环进行 prompt micro-batching，不能静默复制到不可控规模。
+模型侧仍应检查 steering 模式下的 pair 合约，不能只相信 YAML：`len(img_ids) == len(text_ids) == len(img_batch)`，且 `img_ids` 必须是连续的 `arange(P)`。未来若接入天然一图多 prompt 的数据集，应在数据层提供对应的 positive-pair adapter，而不在模型 forward 中静默复制大量图像。
 
-模型侧仍应检查 steering 模式下的 pair 合约，不能只相信 YAML。对于当前 COCO v1，可以要求每个 image row 恰好对应一个 prompt；未来若接入其他天然一图多 prompt 的 image dataset，再启用通用 pair materialization 或 prompt micro-batching。
-
-“把同一图像的 80 个类别文本先聚合成一个 set embedding，再只跑一次视觉 backbone”虽然保留效率，但改变了问题：得到的是 prompt-set-aware 特征，不是 query-specific 特征。这可以作为后续近似方案，不能冒充 SteerViT 的等价迁移。
+“把同一图像的多个类别文本先聚合成一个 set embedding，再只跑一次视觉 backbone”虽然保留效率，但改变了问题：得到的是 prompt-set-aware 特征，不是 query-specific 特征。这可以作为后续近似方案，不能冒充 SteerViT 的等价迁移。
 
 ---
 
@@ -697,25 +731,27 @@ def forward(
 
 1. 调 `forward_text`，一次编码 `U` 条去重文本；
 2. 用 `text_ids` gather 得到 `P x L x 1024` contextual text 与 `P x L` mask；
-3. 用 `img_ids` gather 图像，得到 `P x 3 x 672 x 672` pair images；
-4. conditioned image forward 产生 `P` 份 prompt-specific FPN features；
-5. 下游 pair batch 的 image id 改成 `arange(P)`；
+3. 验证 positive-pair 合约：`len(img_batch) == P` 且 `img_ids == arange(P)`；
+4. 直接使用 `img_batch: P x 3 x 672 x 672` 作为 pair images，不做二次 materialization；
+5. conditioned image forward 产生 `P` 份 prompt-specific FPN features；
 6. 256 维 prompt token 仍由 `text_ids` gather，并送入现有 fusion encoder/decoder；
 7. 该类只在开关开启时构造；关闭时直接使用原 `Sam3Image`，不应通过该类模拟 baseline。
 
-建议把映射逻辑封装为纯函数并单测：
+建议把合约检查封装为纯函数并单测：
 
 ```python
-def materialize_steering_pairs(images, text_output, img_ids, text_ids):
-    ...
+def validate_positive_pair_batch(images, img_ids, text_ids):
+    pair_count = len(images)
+    assert len(img_ids) == len(text_ids) == pair_count
+    assert torch.equal(img_ids, torch.arange(pair_count, device=img_ids.device))
 ```
 
 还应加入：
 
 - `len(img_ids) == len(text_ids) == P` 断言；
 - adapter text batch 与 pair image batch 一致的断言；
-- `max_steering_pairs_per_forward` 上限；
-- 空 prompt、negative query 和重复文本测试。
+- `img_ids == arange(P)` 断言，防止误用一图多 query 的 loader；
+- 空 prompt 和重复文本测试；数据 query 均来自有效的正 image-category records。
 
 ### 7.8 修改 `sam3/model_builder.py`
 
@@ -734,7 +770,6 @@ steering_dropout: float = 0.0
 steering_factor: float = 1.0
 freeze_pretrained_vision: bool = True
 freeze_pretrained_language: bool = True
-max_steering_pairs_per_forward: int | None = None
 ```
 
 构建分支应近似为：
@@ -809,16 +844,20 @@ model:
 
 data:
   train:
-    category_chunk_size: 1
+    coco_json_loader:
+      _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
+      _partial_: true
   val:
-    category_chunk_size: 1
+    coco_json_loader:
+      _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
+      _partial_: true
 
 optimizer:
   # 只为 requires_grad=True 参数建组
   # adapter 和 alpha 使用显式 pattern，且不能与 broad backbone rule 重叠
 ```
 
-`category_chunk_size=1` 是第一版安全设置，不代表最终最优吞吐。等 pair micro-batching 完成并验证后，可提高它。
+`COCOPositivePairFromJSON` 是 SteerSAM image pipeline 的默认 positive-only 数据合约，也已用于当前 frozen-backbone baseline。它在 API 上不接受 `include_negatives` 和 `category_chunk_size`；所以新增 COCO/LVIS 适配时，应继承“直接索引正 pair”的合约，而不是重新暴露这两个开关。SteerSAM 配置不应盲目继承 baseline 的 physical batch size；应先测量 adapter 开启后的峰值显存和吞吐，再确定 physical batch size，并通过 gradient accumulation 对齐 effective batch。
 
 上述是独立 SteerSAM 实验配置，因此显式开启 steering。公共 image builder 的代码默认值和原 SAM3/基线配置仍必须是 `enable_steering: false`。不要在原基线 YAML 中隐式打开该功能。
 
@@ -926,7 +965,7 @@ loss = soft cross-entropy
 L_total = L_SAM3 + lambda_steer * L_patch
 ```
 
-这更接近 SteerViT 的训练信号，但必须作为独立消融。需要明确负样本/空 mask 的定义，避免将全零 target 归一化造成 NaN。
+这更接近 SteerViT 的训练信号，但必须作为独立消融。当前数据合约只保留有效正 image-category pairs，因此辅助目标直接由对应正类别 mask 构造。
 
 ### 9.3 必做消融
 
@@ -953,10 +992,8 @@ L_total = L_SAM3 + lambda_steer * L_patch
 
 除 box AP、mask AP、semantic segmentation 指标外，应增加能直接衡量 steering 的诊断：
 
-- 同一图像换错 prompt 后，目标区域置信度应合理下降；
 - 对两个不同 prompt，vision token 差异和预测差异不能恒为零；
 - gate 值随层和训练步的变化；
-- negative prompt 的 presence calibration；
 - `alpha=0` 的 baseline parity；
 - 每 step 峰值显存、吞吐和 trainable/optimizer-state 参数量。
 
@@ -969,7 +1006,8 @@ L_total = L_SAM3 + lambda_steer * L_patch
 1. 跑通当前 frozen-backbone 配置；
 2. 保存 trainable 参数清单、指标、吞吐和显存；
 3. 用实际 forward 日志确认 `48 x 48` fusion feature 和 `2304` 个视觉 token；
-4. 确认一图多 prompt 的 `img_ids/text_ids` 样例。
+4. 验证 `COCOPositivePairFromJSON` 中每条 record 只含一个正类别 query，同类所有 instance 仍集合在该 target 中；
+5. 在实际 batch 中确认 `P=len(img_batch)=physical_batch_size`、`img_ids=arange(P)`，并检查 `text_ids` 的去重文本映射。
 
 ### 阶段 1：接口与单元测试
 
@@ -989,10 +1027,10 @@ L_total = L_SAM3 + lambda_steer * L_patch
 ### 阶段 3：重构 pair batch
 
 1. 文本先行；
-2. materialize image-text pairs；
-3. `category_chunk_size=1`；
+2. 验证 positive-pair loader/collator 产生 `img_ids=arange(P)`；
+3. 直接以 `img_batch` 作为 pair image batch，用 `text_ids` gather pair text；
 4. 接回 fusion encoder、decoder 和 mask head；
-5. 检查 negative prompt 与 targets 对齐。
+5. 检查正 prompt、同类全部 targets 和 pair mapping 一一对齐。
 
 ### 阶段 4：冻结、optimizer 与 checkpoint
 

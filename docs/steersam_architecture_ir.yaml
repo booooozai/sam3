@@ -1,4 +1,4 @@
-version: "1.0"
+version: "1.1"
 
 figure:
   title: "From SteerViT to SteerSAM"
@@ -25,6 +25,8 @@ metadata:
     - "sam3/model/encoder.py"
     - "sam3/model/sam3_image.py"
     - "sam3/model_builder.py"
+    - "sam3/train/data/coco_json_loaders.py"
+    - "sam3/train/configs/coco/coco2017_full_ft_mask_frozen_backbone.yaml"
   unresolved:
     - "SteerSAM is a proposed architecture; insertion layers and pair-batch policy require ablation."
     - "The conservative enabled default uses four global-block adapters, but 1/2/4/8/16-layer injection densities require ablation."
@@ -33,6 +35,9 @@ metadata:
     video_pipeline: "out-of-scope and unchanged"
     steering_default_enabled: false
     image_resolution: 672
+    coco_primary_training: "positive-only image-category pairs"
+    positive_pair_loader: "COCOPositivePairFromJSON"
+    dataset_scaling: "positive pairs scale with annotations rather than image_count x category_count"
 
 panels:
   - id: steervit
@@ -115,8 +120,13 @@ nodes:
     label: "Image-prompt pair batch"
     role: "preprocess"
     kind: "operator"
-    shape: "P pairs; COCO v1 uses category_chunk_size=1"
+    shape: "P positive pairs from COCOPositivePairFromJSON"
     panel: steersam
+    details:
+      - "The loader indexes distinct positive (image, category) pairs directly from annotations; it exposes neither category chunking nor negative sampling."
+      - "All instances of the selected category remain grouped in the pair target."
+      - "A batch has P equal to the number of image rows and img_ids=arange(P); source images may repeat across positive categories."
+      - "Positive-only indexing scales to large-vocabulary datasets such as LVIS without constructing image_count x category_count records."
   - id: ss_image
     label: "Image"
     role: "input"
