@@ -1,0 +1,294 @@
+version: "1.0"
+
+figure:
+  title: "From SteerViT to SteerSAM"
+  direction: "LR"
+  target: "paper"
+  theme: "paper-light"
+  font: "Arial"
+  width_mm: 178
+  panel_gap_mm: 8
+  architecture_family: "multimodal"
+  layout_preset: "conditioned_flow"
+
+metadata:
+  source_framework: "PyTorch"
+  mode: "paper-detail"
+  source_files:
+    - "SteerViT/src/steervit/model.py"
+    - "SteerViT/src/steervit/backbone.py"
+    - "SteerViT/src/steervit/crossattention.py"
+    - "sam3/model/text_encoder_ve.py"
+    - "sam3/model/vitdet.py"
+    - "sam3/model/necks.py"
+    - "sam3/model/vl_combiner.py"
+    - "sam3/model/encoder.py"
+    - "sam3/model/sam3_image.py"
+    - "sam3/model_builder.py"
+  unresolved:
+    - "SteerSAM is a proposed architecture; insertion layers and pair-batch policy require ablation."
+    - "The conservative enabled default uses four global-block adapters, but 1/2/4/8/16-layer injection densities require ablation."
+  scope:
+    pipeline: "image-only"
+    video_pipeline: "out-of-scope and unchanged"
+    steering_default_enabled: false
+    image_resolution: 672
+
+panels:
+  - id: steervit
+    label: "(a)"
+    title: "SteerViT: implemented source path"
+  - id: steersam
+    label: "(b)"
+    title: "SteerSAM: proposed image-training path"
+  - id: adapter
+    label: "(c)"
+    title: "Proposed gated steering adapter"
+
+nodes:
+  - id: sv_image
+    label: "Image"
+    role: "input"
+    kind: "data"
+    shape: "B x 3 x 336 x 336"
+    panel: steervit
+  - id: sv_patch_embed
+    label: "DINOv2 patch embedding"
+    role: "backbone"
+    kind: "module"
+    shape: "B x 577 x 768"
+    panel: steervit
+  - id: sv_text
+    label: "Referential expression"
+    role: "input"
+    kind: "data"
+    shape: "B strings"
+    panel: steervit
+  - id: sv_roberta
+    label: "Frozen RoBERTa-Large"
+    role: "backbone"
+    kind: "module"
+    shape: "B x L x 1024"
+    panel: steervit
+  - id: sv_connector
+    label: "L2 norm + 2-layer MLP"
+    role: "auxiliary"
+    kind: "module"
+    shape: "1024 -> 1024 -> 768"
+    panel: steervit
+  - id: sv_vit
+    label: "Frozen ViT blocks + gated CA"
+    role: "novel"
+    kind: "module"
+    shape: "B x 577 x 768"
+    repeat: 12
+    panel: steervit
+    details:
+      - "Gated CA is active in blocks 1,3,5,7,9,11 for the default ViT-B model."
+      - "The config lists higher indices too, but they are absent from the 12-block backbone."
+  - id: sv_dense
+    label: "Prompt-aware patch tokens"
+    role: "output"
+    kind: "output"
+    shape: "B x 576 x 768"
+    panel: steervit
+  - id: sv_global
+    label: "Prompt-aware CLS feature"
+    role: "output"
+    kind: "output"
+    shape: "B x 768"
+    panel: steervit
+  - id: sv_seg_head
+    label: "Zero-init linear patch head"
+    role: "head"
+    kind: "module"
+    shape: "768 -> 1 per patch"
+    panel: steervit
+  - id: sv_patch_logits
+    label: "Patch logits / softmax"
+    role: "output"
+    kind: "output"
+    shape: "B x 576"
+    panel: steervit
+
+  - id: ss_pair_contract
+    label: "Image-prompt pair batch"
+    role: "preprocess"
+    kind: "operator"
+    shape: "P pairs; COCO v1 uses category_chunk_size=1"
+    panel: steersam
+  - id: ss_image
+    label: "Image"
+    role: "input"
+    kind: "data"
+    shape: "P x 3 x 672 x 672"
+    panel: steersam
+  - id: ss_text
+    label: "Noun-phrase prompt"
+    role: "input"
+    kind: "data"
+    shape: "P strings; L <= 32"
+    panel: steersam
+  - id: ss_text_encoder
+    label: "Frozen SAM3 text encoder"
+    role: "backbone"
+    kind: "module"
+    shape: "P x L x 1024"
+    panel: steersam
+  - id: ss_text_tap
+    label: "Pre-resizer contextual tokens"
+    role: "auxiliary"
+    kind: "data"
+    shape: "P x L x 1024"
+    panel: steersam
+  - id: ss_resizer
+    label: "Frozen text resizer"
+    role: "backbone"
+    kind: "module"
+    shape: "1024 -> 256"
+    panel: steersam
+  - id: ss_patch_embed
+    label: "Frozen ViT patch embedding"
+    role: "backbone"
+    kind: "module"
+    shape: "P x 48 x 48 x 1024"
+    panel: steersam
+  - id: ss_vit
+    label: "Frozen 32-block ViT + steering adapters"
+    role: "novel"
+    kind: "module"
+    shape: "P x 48 x 48 x 1024"
+    repeat: 32
+    panel: steersam
+    details:
+      - "Steering is disabled by default and the original SAM3 path remains unchanged."
+      - "When enabled, insertion layers are configurable; conservative default: 7, 15, 23, 31."
+      - "Required ablations: 1, 2, 4, 8, and 16 adapters."
+      - "Only adapters and gates inside the frozen trunk remain trainable."
+  - id: ss_fpn
+    label: "SimpleFPN + scalp=1"
+    role: "representation"
+    kind: "module"
+    shape: "P x 256 x {192,96,48}^2; 24x24 removed by scalp=1"
+    panel: steersam
+  - id: ss_late_fusion
+    label: "Existing 6-layer fusion encoder"
+    role: "fusion"
+    kind: "module"
+    shape: "image: 2304 x P x 256; prompt: Lp x P x 256"
+    repeat: 6
+    panel: steersam
+  - id: ss_decoder
+    label: "Existing DETR-like decoder"
+    role: "head"
+    kind: "module"
+    shape: "6 layers; 200 object queries; d=256"
+    repeat: 6
+    panel: steersam
+  - id: ss_heads
+    label: "Box, score, presence, mask heads"
+    role: "head"
+    kind: "module"
+    panel: steersam
+  - id: ss_output
+    label: "Prompt-conditioned boxes and masks"
+    role: "output"
+    kind: "output"
+    panel: steersam
+
+  - id: ad_image_tokens
+    label: "Spatial vision tokens"
+    role: "input"
+    kind: "data"
+    shape: "P x H x W x 1024"
+    panel: adapter
+  - id: ad_flatten_norm
+    label: "Flatten + LayerNorm"
+    role: "operator"
+    kind: "operator"
+    shape: "P x HW x 1024"
+    panel: adapter
+  - id: ad_text_tokens
+    label: "Contextual text tokens"
+    role: "input"
+    kind: "data"
+    shape: "P x L x 1024"
+    panel: adapter
+  - id: ad_cross_attention
+    label: "Masked cross-attention"
+    role: "novel"
+    kind: "module"
+    shape: "Q=image; K,V=text; 16 heads x 64"
+    panel: adapter
+  - id: ad_gate
+    label: "tanh(alpha_l) x steering_factor"
+    role: "novel"
+    kind: "operator"
+    shape: "scalar; alpha_l initialized to 0"
+    panel: adapter
+  - id: ad_add
+    label: "+"
+    role: "fusion"
+    kind: "merge"
+    panel: adapter
+  - id: ad_output
+    label: "Steered spatial tokens"
+    role: "output"
+    kind: "output"
+    shape: "P x H x W x 1024"
+    panel: adapter
+
+edges:
+  - {from: sv_image, to: sv_patch_embed, type: main}
+  - {from: sv_patch_embed, to: sv_vit, type: main}
+  - {from: sv_text, to: sv_roberta, type: main}
+  - {from: sv_roberta, to: sv_connector, type: main}
+  - {from: sv_connector, to: sv_vit, type: conditioning, label: "K,V"}
+  - {from: sv_vit, to: sv_dense, type: main}
+  - {from: sv_vit, to: sv_global, type: main}
+  - {from: sv_dense, to: sv_seg_head, type: training}
+  - {from: sv_seg_head, to: sv_patch_logits, type: training}
+
+  - {from: ss_pair_contract, to: ss_image, type: main}
+  - {from: ss_pair_contract, to: ss_text, type: main}
+  - {from: ss_text, to: ss_text_encoder, type: main}
+  - {from: ss_text_encoder, to: ss_text_tap, type: main}
+  - {from: ss_text_tap, to: ss_resizer, type: main}
+  - {from: ss_image, to: ss_patch_embed, type: main}
+  - {from: ss_patch_embed, to: ss_vit, type: main}
+  - {from: ss_text_tap, to: ss_vit, type: conditioning, label: "early steering K,V"}
+  - {from: ss_vit, to: ss_fpn, type: main}
+  - {from: ss_fpn, to: ss_late_fusion, type: main}
+  - {from: ss_resizer, to: ss_late_fusion, type: conditioning, label: "existing late fusion"}
+  - {from: ss_late_fusion, to: ss_decoder, type: main}
+  - {from: ss_resizer, to: ss_decoder, type: conditioning, label: "prompt tokens"}
+  - {from: ss_decoder, to: ss_heads, type: main}
+  - {from: ss_fpn, to: ss_heads, type: auxiliary, label: "multi-scale pixels"}
+  - {from: ss_heads, to: ss_output, type: main}
+
+  - {from: ad_image_tokens, to: ad_flatten_norm, type: main}
+  - {from: ad_flatten_norm, to: ad_cross_attention, type: main, label: "Q"}
+  - {from: ad_text_tokens, to: ad_cross_attention, type: conditioning, label: "K,V + valid-token mask"}
+  - {from: ad_cross_attention, to: ad_gate, type: main}
+  - {from: ad_gate, to: ad_add, type: main}
+  - {from: ad_image_tokens, to: ad_add, type: residual}
+  - {from: ad_add, to: ad_output, type: main}
+
+annotations:
+  - "Solid edges are main data flow; dashed/conditioning edges carry text; training edges exist only for supervision."
+  - "P denotes prompt-image pairs, not necessarily the number of unique source images."
+
+groups:
+  - id: frozen_modules
+    label: "Frozen pretrained modules"
+    node_ids: [sv_roberta, sv_patch_embed, ss_text_encoder, ss_resizer, ss_patch_embed]
+  - id: trainable_steering
+    label: "Trainable steering path"
+    node_ids: [sv_connector, sv_seg_head, ad_cross_attention, ad_gate]
+
+style:
+  compact: false
+  show_shapes: true
+  show_repeat_badges: true
+  visual_grammar: true
+  colors: {}
