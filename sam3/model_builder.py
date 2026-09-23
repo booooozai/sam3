@@ -69,10 +69,10 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None):
+def _create_vit_backbone(compile_mode=None, image_size=1008):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
-        img_size=1008,
+        img_size=image_size,
         pretrain_img_size=336,
         patch_size=14,
         embed_dim=1024,
@@ -153,7 +153,7 @@ def _create_transformer_encoder() -> TransformerEncoderFusion:
     return encoder
 
 
-def _create_transformer_decoder() -> TransformerDecoder:
+def _create_transformer_decoder(resolution=1008) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -182,7 +182,7 @@ def _create_transformer_decoder() -> TransformerDecoder:
         frozen=False,
         interaction_layer=None,
         dac_use_selfatt_ln=True,
-        resolution=1008,
+        resolution=resolution,
         stride=14,
         use_act_checkpoint=True,
         presence_token=True,
@@ -499,13 +499,15 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, resolution=1008
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=resolution)
     # ViT backbone
-    vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
+    vit_backbone: ViT = _create_vit_backbone(
+        compile_mode=compile_mode, image_size=resolution
+    )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
@@ -515,10 +517,12 @@ def _create_vision_backbone(
     return vit_neck
 
 
-def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrapper:
+def _create_sam3_transformer(
+    has_presence_token: bool = True, resolution=1008
+) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
     encoder: TransformerEncoderFusion = _create_transformer_encoder()
-    decoder: TransformerDecoder = _create_transformer_decoder()
+    decoder: TransformerDecoder = _create_transformer_decoder(resolution=resolution)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
@@ -540,6 +544,22 @@ def _load_checkpoint(model, checkpoint_path):
                 if "tracker" in k
             }
         )
+
+    # RoPE frequencies are registered buffers whose shape depends on the
+    # runtime image resolution.  They are regenerated when constructing the
+    # model, so a checkpoint created at 1008 cannot be loaded into a model
+    # configured for 672 (and vice versa).
+    skipped_dynamic_keys = [
+        key for key in sam3_image_ckpt if key.endswith(".freqs_cis")
+    ]
+    for key in skipped_dynamic_keys:
+        del sam3_image_ckpt[key]
+    if skipped_dynamic_keys:
+        print(
+            "Skipping resolution-dependent RoPE buffers from checkpoint: "
+            f"{skipped_dynamic_keys}"
+        )
+
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
     if len(missing_keys) > 0:
         print(
@@ -565,6 +585,9 @@ def build_sam3_image_model(
     load_from_HF=True,
     enable_segmentation=True,
     enable_inst_interactivity=False,
+    freeze_vision_backbone=False,
+    freeze_language_backbone=False,
+    resolution=1008,
     compile=False,
 ):
     """
@@ -577,6 +600,9 @@ def build_sam3_image_model(
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
+        freeze_vision_backbone: Disable gradients for the visual backbone.
+        freeze_language_backbone: Disable gradients for the language backbone.
+        resolution: Input image resolution used by the visual backbone and decoder.
         compile_mode: To enable compilation, set to "default"
 
     Returns:
@@ -590,7 +616,9 @@ def build_sam3_image_model(
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        compile_mode=compile_mode,
+        enable_inst_interactivity=enable_inst_interactivity,
+        resolution=resolution,
     )
 
     # Create text components
@@ -600,7 +628,7 @@ def build_sam3_image_model(
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
     # Create transformer components
-    transformer = _create_sam3_transformer()
+    transformer = _create_sam3_transformer(resolution=resolution)
 
     # Create dot product scoring
     dot_prod_scoring = _create_dot_product_scoring()
@@ -634,6 +662,13 @@ def build_sam3_image_model(
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
+
+    # Freeze after checkpoint loading so the pretrained backbone remains intact
+    # while autograd can omit its backward graph during fine-tuning.
+    if freeze_vision_backbone:
+        model.backbone.vision_backbone.requires_grad_(False)
+    if freeze_language_backbone:
+        model.backbone.language_backbone.requires_grad_(False)
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
