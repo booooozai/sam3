@@ -1,0 +1,3 @@
+[submodule "SteerViT"]
+	path = SteerViT
+	url = https://github.com/manugaurdl/SteerViT.git
