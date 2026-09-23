@@ -54,6 +54,10 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
         logging.info(e)
 
     trainer = instantiate(cfg.trainer, _recursive_=False)
+    if os.environ.get("NAN_DIAG"):
+        # Abort at the first backward op that produces NaN/Inf, with the
+        # forward trace that created it. Slows training down; diagnostics only.
+        torch.autograd.set_detect_anomaly(True)
     trainer.run()
 
 

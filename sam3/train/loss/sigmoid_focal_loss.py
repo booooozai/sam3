@@ -141,8 +141,15 @@ def _inner_focal_loss_bwd(inputs, targets, alpha, gamma):
 
     # Modulating factor
     p_t = sig * targets + inv_sig * inv_targets
-    tmp = libdevice.pow(1 - p_t, gamma - 1)
-    mod_factor = tmp * (1 - p_t)
+    # For saturated logits p_t == 1 exactly and 1 - p_t == 0. pow(0, gamma)
+    # matches the forward exactly (0^0 == 1, 0^g == 0 for g > 0), whereas the
+    # previous reconstruction tmp * (1 - p_t) produced inf * 0 == NaN for
+    # gamma <= 1. The d(mod_factor)/dx term is clamped to 0 at saturation,
+    # which is its correct limit for gamma > 0 and the exact value (0) for
+    # gamma == 0, where the modulating factor is constant.
+    one_minus_pt = 1 - p_t
+    mod_factor = libdevice.pow(one_minus_pt, gamma)
+    tmp = tl.where(one_minus_pt > 1e-6, libdevice.pow(one_minus_pt, gamma - 1), 0.0)
 
     # Alpha factor
     alpha_t = alpha * targets + (1 - alpha) * inv_targets

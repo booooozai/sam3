@@ -17,6 +17,12 @@ def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
     if repeats > 1:
         cost = np.tile(cost, (1, repeats))
 
+    if not np.isfinite(cost).all():
+        # Non-finite model outputs make scipy raise an opaque ValueError here;
+        # map them to the invalid-entry sentinel so the failure surfaces
+        # downstream as a non-finite loss instead.
+        cost = np.where(np.isfinite(cost), cost, 1e9)
+
     i, j = linear_sum_assignment(cost)
     if do_filtering:
         # filter out invalid entries (i.e. those with cost > 1e8)

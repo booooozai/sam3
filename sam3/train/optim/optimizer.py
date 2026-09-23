@@ -383,14 +383,55 @@ class GradientClipper:
         assert isinstance(max_norm, (int, float)) or max_norm is None
         self.max_norm = max_norm if max_norm is None else float(max_norm)
         self.norm_type = norm_type
+        self._diag_count = 0
+        self._skip_count = 0
 
     def __call__(self, model: nn.Module):
         if self.max_norm is None:
             return  # no-op
 
-        nn.utils.clip_grad_norm_(
+        params = list(model.named_parameters())
+        # Diagnose before clipping: clip_grad_norm_ multiplies every gradient
+        # by NaN once any single gradient is NaN, hiding the source.
+        if self._diag_count < 3:
+            bad = [
+                (n, int((~torch.isfinite(p.grad)).sum().item()))
+                for n, p in params
+                if p.grad is not None and not torch.isfinite(p.grad).all().item()
+            ]
+            if bad:
+                self._diag_count += 1
+                logging.warning(
+                    "Pre-clip non-finite grads: %d tensors affected, first %s",
+                    len(bad),
+                    bad[:10],
+                )
+
+        total_norm = nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=self.max_norm, norm_type=self.norm_type
         )
+        # A NaN/Inf gradient makes clip_grad_norm_ multiply every gradient by
+        # NaN. The GradScaler rejects such steps when AMP is on, but with AMP
+        # off nothing else does, so zero the gradients to keep the optimizer
+        # states finite at the cost of one wasted step.
+        if not torch.isfinite(total_norm).all().item():
+            self._skip_count += 1
+            if self._skip_count <= 3:
+                n_bad_weights = sum(
+                    1
+                    for _, p in params
+                    if not torch.isfinite(p).all().item()
+                )
+                logging.warning(
+                    "Non-finite gradient norm (%s), occurrence %d; "
+                    "non-finite weight tensors: %d",
+                    total_norm,
+                    self._skip_count,
+                    n_bad_weights,
+                )
+            for _, p in params:
+                if p.grad is not None:
+                    p.grad.zero_()
 
 
 class ValueScaler:
