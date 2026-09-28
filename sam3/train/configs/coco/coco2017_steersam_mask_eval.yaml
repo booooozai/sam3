@@ -1,0 +1,103 @@
+# @package _global_
+defaults:
+  - coco2017_steersam_mask
+  - _self_
+
+# Standalone exhaustive evaluation for a trained SteerSAM checkpoint.
+# This is intentionally separate from train-time positive-only validation.
+paths:
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/coco2017_steersam_mask_strategy2_eval
+  checkpoint_path: /share/Pub_Datasets/chenshengbo/outputs/coco2017mini_steersam_mask_strategy2/checkpoints/checkpoint.pt
+
+scratch:
+  # Evaluation has no backward graph, but a conservative batch makes this
+  # command portable and leaves room for mask interpolation/post-processing.
+  val_batch_size: 8
+  # ``null`` evaluates all COCO val2017 images. A positive value limits source
+  # images before COCOAllCategoryPairsFromJSON expands them into 80 prompts,
+  # so each selected image still receives the complete COCO category set.
+  coco_eval_num_images: ${oc.decode:${oc.env:COCO_EVAL_NUM_IMAGES,null}}
+
+
+trainer:
+  mode: val
+  max_epochs: 1
+  skip_saving_ckpts: true
+  skip_first_val: true
+
+  data:
+    train: null
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        load_segmentation: ${scratch.enable_segmentation}
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCOAllCategoryPairsFromJSON
+          max_images: ${scratch.coco_eval_num_images}
+          _partial_: true
+        img_folder: ${paths.coco_root}/val2017
+        ann_file: ${paths.coco_root}/annotations/instances_val2017.json
+        transforms: ${coco_train.val_transforms}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+
+  model:
+    eval_mode: true
+
+  # Formal evaluation only needs predictions. Avoid running the training
+  # matcher/loss over 400k prompt pairs.
+  loss:
+    all:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+
+  meters:
+    val:
+      coco2017:
+        # Standard category-aware COCO metrics.  The postprocessors use the
+        # original image/category ids; online_topk bounds memory at 100
+        # detections per source image while all 80 prompts are streamed.
+        segmentation:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "segm"
+          dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017_mask
+          merge_predictions: true
+          online_topk: true
+          postprocessor: ${scratch.original_mask_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 100
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: ${paths.coco_root}/annotations/instances_val2017.json
+              tide: false
+              iou_type: "segm"
+        detection:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "bbox"
+          dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017
+          merge_predictions: true
+          online_topk: true
+          postprocessor: ${scratch.original_box_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 100
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: ${paths.coco_root}/annotations/instances_val2017.json
+              tide: false
+              iou_type: "bbox"
+
+
+  checkpoint:
+    # Keep eval artifacts separate from the training checkpoint directory so
+    # Trainer does not mistake an eval-side checkpoint for a resume target.
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0

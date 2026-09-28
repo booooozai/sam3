@@ -3,8 +3,9 @@
 # pyre-unsafe
 
 import json
+import os
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from pycocotools import mask as mask_util
@@ -113,6 +114,7 @@ class COCO_FROM_JSON:
         prompts=None,
         include_negatives=True,
         category_chunk_size=None,
+        max_images: Optional[int] = None,
     ):
         """
         Initialize the COCO training API.
@@ -125,6 +127,18 @@ class COCO_FROM_JSON:
         self._raw_data, self._cat_idx_to_text = load_coco_and_group_by_image(
             annotation_file
         )
+        if max_images is not None:
+            max_images = int(max_images)
+            if max_images <= 0:
+                raise ValueError(
+                    f"max_images must be a positive integer or None, got {max_images}"
+                )
+            # ``_raw_data`` is deterministically sorted by original COCO image
+            # id.  Limit at this level, before category chunks are expanded, so
+            # a smoke evaluation retains every category prompt for each chosen
+            # source image rather than truncating arbitrary image-chunk rows.
+            self._raw_data = self._raw_data[:max_images]
+        self.max_images = max_images
         self._sorted_cat_ids = sorted(list(self._cat_idx_to_text.keys()))
         self.prompts = None
         self.include_negatives = include_negatives
@@ -142,9 +156,9 @@ class COCO_FROM_JSON:
             self.prompts = {}
             for loc_dict in prompts:
                 self.prompts[int(loc_dict["id"])] = loc_dict["name"]
-            assert len(self.prompts) == len(self._sorted_cat_ids), (
-                "Number of prompts must match number of categories"
-            )
+            assert len(self.prompts) == len(
+                self._sorted_cat_ids
+            ), "Number of prompts must match number of categories"
 
     def getDatapointIds(self):
         """Return datapoints that can produce at least one find query.
@@ -241,7 +255,8 @@ class COCO_FROM_JSON:
                 annotation = annot_template.copy()
                 annotation["id"] = len(annotations)
                 annotation["object_id"] = annotation["id"]
-                annotation["is_crowd"] = ann["iscrowd"]
+                # LVIS follows the COCO annotation layout but omits iscrowd.
+                annotation["is_crowd"] = ann.get("iscrowd", 0)
 
                 normalized_boxes = convert_boxlist_to_normalized_tensor(
                     [ann["bbox"]], width, height
@@ -361,6 +376,133 @@ class COCOPositivePairFromJSON(COCO_FROM_JSON):
     def loadImagesFromDatapoint(self, idx):
         image_idx, _ = self._positive_pairs[idx]
         return self._load_image_from_image_index(image_idx)
+
+
+
+
+class LVISVerifiedCategoriesFromJSON(COCO_FROM_JSON):
+    """Load exactly the LVIS categories verified for each validation image.
+
+    LVIS uses federated annotations: a missing annotation is a true negative
+    only when its category appears in ``neg_category_ids``; categories outside
+    the positive/negative verified sets must be ignored.  Querying the union of
+    annotated positive categories and explicit negative categories is therefore
+    both sufficient for official LVIS evaluation and substantially cheaper than
+    evaluating all 1,203 categories on every image.
+
+    One datapoint contains one image and all of its verified categories.  LVIS
+    v1 validation contains at most a small number of verified categories per
+    image, so this also avoids repeatedly encoding the same image.
+    """
+
+    def __init__(self, annotation_file, prompts=None):
+        super().__init__(
+            annotation_file=annotation_file,
+            prompts=prompts,
+            include_negatives=True,
+            category_chunk_size=None,
+        )
+        if self.prompts is None:
+            self._cat_idx_to_text = {
+                category_id: name.replace("_", " ")
+                for category_id, name in self._cat_idx_to_text.items()
+            }
+
+        known_categories = set(self._cat_idx_to_text)
+        self._verified_categories = {}
+        for image_idx, record in enumerate(self._raw_data):
+            image_info = record["image"]
+            positive_categories = {
+                int(annotation["category_id"])
+                for annotation in record["annotations"]
+            }
+            negative_categories = {
+                int(category_id)
+                for category_id in image_info.get("neg_category_ids", [])
+            }
+            overlap = positive_categories.intersection(negative_categories)
+            if overlap:
+                raise ValueError(
+                    f"LVIS image {image_info['id']} marks categories as both "
+                    f"positive and negative: {sorted(overlap)}."
+                )
+            verified = positive_categories.union(negative_categories)
+            unknown = verified - known_categories
+            if unknown:
+                raise ValueError(
+                    f"LVIS image {image_info['id']} references unknown categories: "
+                    f"{sorted(unknown)}."
+                )
+            if verified:
+                self._verified_categories[image_idx] = sorted(verified)
+
+    def getDatapointIds(self):
+        return sorted(self._verified_categories)
+
+    def loadQueriesAndAnnotationsFromDatapoint(self, idx):
+        queries, annotations = self._load_queries_and_annotations_for_categories(
+            idx, self._verified_categories[idx]
+        )
+        image_info = self._raw_data[idx]["image"]
+        not_exhaustive = {
+            int(category_id)
+            for category_id in image_info.get("not_exhaustive_category_ids", [])
+        }
+        for query in queries:
+            exhaustive = query["original_cat_id"] not in not_exhaustive
+            query["is_exhaustive"] = exhaustive
+            query["is_pixel_exhaustive"] = exhaustive
+        return queries, annotations
+
+    def loadImagesFromDatapoint(self, idx):
+        image_info = self._raw_data[idx]["image"]
+        # LVIS val is federated over images originating from both COCO
+        # train2017 and val2017.  Preserve that split directory from coco_url;
+        # using a single val2017 root silently drops a large fraction of LVIS.
+        coco_split = os.path.basename(os.path.dirname(image_info["coco_url"]))
+        return [
+            {
+                "id": 0,
+                "file_name": os.path.join(
+                    coco_split, os.path.basename(image_info["coco_url"])
+                ),
+                "original_img_id": image_info["id"],
+                "coco_img_id": image_info["id"],
+            }
+        ]
+
+
+
+
+class COCOAllCategoryPairsFromJSON(COCO_FROM_JSON):
+    """Expose every image-category pair with a stable pair-level evaluation id.
+
+    This loader is intended for standalone, exhaustive evaluation of a
+    prompt-conditioned image model.  Every record contains one image and one
+    category prompt, including categories that are absent from the image.  The
+    original COCO image/category ids are preserved for standard AP, while
+    ``coco_img_id`` is replaced by the one-based datapoint id so prompt-pair
+    metrics can treat ``(image, category)`` as the evaluation unit.
+
+    The ordering is deterministic: images are sorted by image id and categories
+    are sorted by category id, matching ``build_prompt_pair_ground_truth`` in
+    ``sam3.eval.prompt_pair_eval``.
+    """
+
+    def __init__(self, annotation_file, prompts=None, max_images=None):
+        super().__init__(
+            annotation_file=annotation_file,
+            prompts=prompts,
+            include_negatives=True,
+            category_chunk_size=1,
+            max_images=max_images,
+        )
+
+    def loadImagesFromDatapoint(self, idx):
+        images = super().loadImagesFromDatapoint(idx)
+        assert len(images) == 1
+        images[0]["coco_img_id"] = int(idx) + 1
+        return images
 
 
 # ============================================================================

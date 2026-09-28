@@ -53,12 +53,23 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
     except Exception as e:
         logging.info(e)
 
-    trainer = instantiate(cfg.trainer, _recursive_=False)
-    if os.environ.get("NAN_DIAG"):
-        # Abort at the first backward op that produces NaN/Inf, with the
-        # forward trace that created it. Slows training down; diagnostics only.
-        torch.autograd.set_detect_anomaly(True)
-    trainer.run()
+    run_succeeded = False
+    try:
+        trainer = instantiate(cfg.trainer, _recursive_=False)
+        if os.environ.get("NAN_DIAG"):
+            # Abort at the first backward op that produces NaN/Inf, with the
+            # forward trace that created it. Slows training down; diagnostics only.
+            torch.autograd.set_detect_anomaly(True)
+        trainer.run()
+        run_succeeded = True
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # Keep the TCPStore alive until every successful worker reaches the
+            # end, then release NCCL resources explicitly. On an exception,
+            # avoid a barrier that could wait forever for a failed peer.
+            if run_succeeded:
+                torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
 
 
 def single_node_runner(cfg, main_port: int):

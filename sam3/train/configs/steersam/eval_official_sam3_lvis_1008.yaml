@@ -1,0 +1,130 @@
+# @package _global_
+defaults:
+  - /configs/coco/coco2017_full_ft_mask.yaml
+  - _self_
+
+# Official zero-shot LVIS v1 validation for the original SAM3 checkpoint.
+# Only per-image verified positive/negative categories are queried.  Categories
+# not verified for an image are intentionally absent, matching LVIS federated
+# evaluation rather than incorrectly treating every missing annotation as a
+# negative.
+
+paths:
+  lvis_root: /home/chenshengbo/workspace/sam3/data/lvis
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/eval_official_sam3_lvis_val_r1008
+
+scratch:
+  resolution: 1008
+  val_batch_size: 4
+  lvis_max_dets: 300
+  gather_pred_via_filesys: true
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: lvis
+    with_seg_masks: false
+  lvis_box_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: -1
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_presence: ${scratch.use_presence_eval}
+  lvis_mask_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: -1
+    iou_type: segm
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_original_sizes_mask: true
+    convert_mask_to_rle: true
+    use_presence: ${scratch.use_presence_eval}
+
+lvis_official_meters:
+  lvis:
+    segmentation:
+      _target_: sam3.eval.coco_writer.PredictionDumper
+      iou_type: segm
+      dump_dir: ${launcher.experiment_log_dir}/dumps/lvis_mask
+      merge_predictions: true
+      online_topk: true
+      postprocessor: ${scratch.lvis_mask_postprocessor}
+      gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+      maxdets: ${scratch.lvis_max_dets}
+      pred_file_evaluators:
+        - _target_: sam3.eval.lvis_eval_offline.LVISEvaluatorOfflineWithPredFile
+          gt_path: ${paths.lvis_root}/annotations/lvis_v1_val.json
+          iou_type: segm
+          max_dets: ${scratch.lvis_max_dets}
+    detection:
+      _target_: sam3.eval.coco_writer.PredictionDumper
+      iou_type: bbox
+      dump_dir: ${launcher.experiment_log_dir}/dumps/lvis_bbox
+      merge_predictions: true
+      online_topk: true
+      postprocessor: ${scratch.lvis_box_postprocessor}
+      gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+      maxdets: ${scratch.lvis_max_dets}
+      pred_file_evaluators:
+        - _target_: sam3.eval.lvis_eval_offline.LVISEvaluatorOfflineWithPredFile
+          gt_path: ${paths.lvis_root}/annotations/lvis_v1_val.json
+          iou_type: bbox
+          max_dets: ${scratch.lvis_max_dets}
+
+# Keep the dataset outside trainer and interpolate the complete node.  This
+# prevents Hydra from recursively merging the inherited COCO loader arguments
+# (include_negatives/category_chunk_size) into the LVIS-specific loader.
+lvis_official_dataset:
+  _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+  coco_json_loader:
+    _target_: sam3.train.data.coco_json_loaders.LVISVerifiedCategoriesFromJSON
+    _partial_: true
+  # LVIS val references images from both COCO train2017 and val2017; the loader
+  # returns split-relative paths such as train2017/000000000009.jpg.
+  img_folder: ${paths.lvis_root}
+  ann_file: ${paths.lvis_root}/annotations/lvis_v1_val.json
+  transforms: ${coco_train.val_transforms}
+  load_segmentation: false
+  max_ann_per_img: 100000
+  multiplier: 1
+  max_val_queries: 50
+  training: false
+  use_caching: false
+
+trainer:
+  mode: val
+  max_epochs: 1
+  skip_saving_ckpts: true
+  skip_first_val: true
+  data:
+    train: null
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset: ${lvis_official_dataset}
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+  model:
+    eval_mode: true
+    enable_segmentation: true
+    enable_steering: false
+    enable_patch_supervision: false
+    resolution: ${scratch.resolution}
+  loss:
+    all:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+  meters:
+    val: ${lvis_official_meters}
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0
+  logging:
+    log_dir: ${launcher.experiment_log_dir}/logs/lvis_official
+
+launcher:
+  experiment_log_dir: ${paths.experiment_log_dir}

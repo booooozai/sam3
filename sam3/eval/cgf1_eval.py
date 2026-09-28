@@ -590,7 +590,7 @@ class CGF1Evaluator:
             if (img["is_instance_exhaustive"] and img["id"] not in exclude_img_ids)
         ]
 
-    def evaluate(self, pred_file: str):
+    def evaluate(self, pred_file: str | list):
         """
         Evaluate the detections using cgF1 metric.
 
@@ -606,8 +606,13 @@ class CGF1Evaluator:
         if self.verbose:
             print(f"Loading predictions from {pred_file}")
 
-        with open(pred_file, "r") as f:
-            preds = json.load(f)
+        if isinstance(pred_file, (str, os.PathLike)):
+            with open(pred_file, "r") as f:
+                preds = json.load(f)
+        else:
+            if not isinstance(pred_file, list):
+                raise TypeError("pred_file must be a prediction path or a list of predictions")
+            preds = pred_file
 
         if self.verbose:
             print(f"Loaded {len(preds)} predictions")

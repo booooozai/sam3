@@ -1,0 +1,121 @@
+# @package _global_
+defaults:
+  - /configs/eval_base.yaml
+  - _self_
+
+# Official SAM 3 evaluation on COCO-O (tattoo domain).
+# Reproduces the APo column of the paper's Tab. 1 (box AP, SAM 3 = 55.7
+# averaged over the six COCO-O domains). Protocol: every image is prompted
+# with all 80 COCO category noun phrases (chunks of 20), predictions are
+# scored with pycocotools COCOeval (maxDets=100) against this domain's
+# instances_val2017.json. Image ids are per-domain (restart at 1), so domains
+# are evaluated separately and then averaged (official COCO-O protocol).
+#
+# NOTE on segm: COCO-O is a box-only detection benchmark -- every annotation
+# in all six domains has an empty "segmentation" field, so no instance
+# segmentation AP can be computed against ground truth (the SAM 3 paper
+# likewise reports COCO-O only under Box Detection in Tab. 1). A segm
+# PredictionDumper evaluator would crash in pycocotools annToRLE.
+
+paths:
+  coco_root: /home/chenshengbo/workspace/sam3/data/coco_o/tattoo
+  experiment_log_dir: ${oc.env:COCO_O_OUTPUT_ROOT,/share/Pub_Datasets/chenshengbo/outputs/eval_official_sam3_coco_o_r1008}/tattoo/
+
+scratch:
+  # null evaluates all images; a small value (e.g. 8) gives a fast smoke test
+  # that still covers every category prompt for each chosen image.
+  coco_eval_num_images: ${oc.decode:${oc.env:COCO_EVAL_NUM_IMAGES,null}}
+  coco_eval_category_chunk_size: 20
+  # Batch 2 (2 images x 20 prompts per forward) peaks at ~26 GB on A100-40GB
+  # at resolution 1008; batch 4 OOMs.
+  val_batch_size: 2
+
+  original_box_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: -1 # infinite detections
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_presence: ${scratch.use_presence_eval}
+
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: coco_o_tattoo
+    with_seg_masks: false
+
+coco_train:
+  val_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: false
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.val_norm_mean}
+          std: ${scratch.val_norm_std}
+
+trainer:
+  mode: val
+  max_epochs: 1
+  val_epoch_freq: 1
+
+  data:
+    train: null
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        load_segmentation: false
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: ${scratch.coco_eval_category_chunk_size}
+          max_images: ${scratch.coco_eval_num_images}
+          _partial_: true
+        img_folder: ${paths.coco_root}/val2017
+        ann_file: ${paths.coco_root}/annotations/instances_val2017.json
+        transforms: ${coco_train.val_transforms}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+        use_caching: false
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+
+  model:
+    resolution: ${scratch.resolution}
+    enable_steering: false
+    enable_patch_supervision: false
+
+  meters:
+    val:
+      coco_o_tattoo:
+        detection:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "bbox"
+          dump_dir: ${launcher.experiment_log_dir}/dumps/coco_o_tattoo_bbox
+          merge_predictions: true
+          online_topk: true
+          postprocessor: ${scratch.original_box_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 100
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: ${paths.coco_root}/annotations/instances_val2017.json
+              tide: false
+              iou_type: "bbox"
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 2

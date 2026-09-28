@@ -1,0 +1,116 @@
+# @package _global_
+defaults:
+  - /configs/coco/coco2017_full_ft_mask.yaml
+  - _self_
+
+# Official zero-shot COCO val2017 evaluation for the original SAM3 checkpoint.
+# Every image is queried with all 80 categories, including absent categories;
+# predictions retain original COCO image/category ids and are evaluated with
+# pycocotools COCOeval for bbox and segmentation AP.
+
+paths:
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/eval_official_sam3_coco_val_r1008
+
+scratch:
+  resolution: 1008
+  val_batch_size: 4
+  # ``null`` evaluates all 5,000 val2017 images. Set a small positive number
+  # for a smoke run; every selected image still receives all 80 category
+  # prompts, independent of category chunking below.
+  coco_eval_num_images: ${oc.decode:${oc.env:COCO_EVAL_NUM_IMAGES,null}}
+  # Twenty prompts share one image encoding.  Reduce this value only if the
+  # standalone evaluation exceeds available GPU memory.
+  coco_eval_category_chunk_size: 20
+  gather_pred_via_filesys: true
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: coco2017
+    with_seg_masks: false
+
+coco_official_meters:
+  coco2017:
+    segmentation:
+      _target_: sam3.eval.coco_writer.PredictionDumper
+      iou_type: segm
+      dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017_mask
+      merge_predictions: true
+      online_topk: true
+      postprocessor: ${scratch.original_mask_postprocessor}
+      gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+      maxdets: 100
+      pred_file_evaluators:
+        - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+          gt_path: ${paths.coco_root}/annotations/instances_val2017.json
+          tide: false
+          iou_type: segm
+          positive_split: false
+    detection:
+      _target_: sam3.eval.coco_writer.PredictionDumper
+      iou_type: bbox
+      dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017_bbox
+      merge_predictions: true
+      online_topk: true
+      postprocessor: ${scratch.original_box_postprocessor}
+      gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+      maxdets: 100
+      pred_file_evaluators:
+        - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+          gt_path: ${paths.coco_root}/annotations/instances_val2017.json
+          tide: false
+          iou_type: bbox
+          positive_split: false
+
+trainer:
+  mode: val
+  max_epochs: 1
+  skip_saving_ckpts: true
+  skip_first_val: true
+  data:
+    train: null
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: ${scratch.coco_eval_category_chunk_size}
+          max_images: ${scratch.coco_eval_num_images}
+          _partial_: true
+        img_folder: ${paths.coco_root}/val2017
+        ann_file: ${paths.coco_root}/annotations/instances_val2017.json
+        transforms: ${coco_train.val_transforms}
+        load_segmentation: false
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+        use_caching: false
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+  model:
+    eval_mode: true
+    enable_segmentation: true
+    enable_steering: false
+    enable_patch_supervision: false
+    resolution: ${scratch.resolution}
+  loss:
+    all:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+  meters:
+    val: ${coco_official_meters}
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0
+  logging:
+    log_dir: ${launcher.experiment_log_dir}/logs/coco_official
+
+launcher:
+  experiment_log_dir: ${paths.experiment_log_dir}

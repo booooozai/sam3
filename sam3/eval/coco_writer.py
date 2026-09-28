@@ -21,10 +21,12 @@ from typing import Any, Optional
 
 import pycocotools.mask as mask_utils
 import torch
+import torch.distributed as dist
 from iopath.common.file_io import g_pathmgr
 from sam3.eval.coco_eval_offline import convert_to_xywh
 from sam3.train.masks_ops import rle_encode
 from sam3.train.utils.distributed import (
+    _get_global_gloo_group,
     all_gather,
     gather_to_rank_0_via_filesys,
     get_rank,
@@ -62,6 +64,7 @@ class PredictionDumper:
         gather_pred_via_filesys: bool = False,
         merge_predictions: bool = False,
         pred_file_evaluators: Optional[Any] = None,
+        online_topk: bool = False,
     ):
         """
         Initialize the PredictionDumper.
@@ -82,10 +85,11 @@ class PredictionDumper:
         self.gather_pred_via_filesys = gather_pred_via_filesys
         self.merge_predictions = merge_predictions
         self.pred_file_evaluators = pred_file_evaluators
+        self.online_topk = online_topk
         if self.pred_file_evaluators is not None:
-            assert merge_predictions, (
-                "merge_predictions must be True if pred_file_evaluators are provided"
-            )
+            assert (
+                merge_predictions
+            ), "merge_predictions must be True if pred_file_evaluators are provided"
         assert self.dump_dir is not None, "dump_dir must be provided"
 
         if is_main_process():
@@ -118,7 +122,23 @@ class PredictionDumper:
             if "bbox" in r:
                 r["bbox"] = [round(coord, 5) for coord in r["bbox"]]
             r["score"] = round(r["score"], 5)
-        self.dump.extend(dumped_results)
+        if not self.online_topk:
+            self.dump.extend(dumped_results)
+            return
+
+        # Exhaustive prompt evaluation visits the same source image once per
+        # category.  Keeping every decoder output until epoch end can require
+        # hundreds of millions of Python dictionaries even though COCO only
+        # consumes the top ``maxdets`` results per image.  Maintain that heap
+        # online so memory scales with images rather than image-prompt pairs.
+        assert self.maxdets > 0, "online_topk requires a positive maxdets"
+        for result in dumped_results:
+            image_heap = self._online_heaps[result["image_id"]]
+            element = HeapElement(result)
+            if len(image_heap) < self.maxdets:
+                heapq.heappush(image_heap, element)
+            else:
+                heapq.heappushpop(image_heap, element)
 
     def synchronize_between_processes(self):
         """
@@ -129,6 +149,13 @@ class PredictionDumper:
         Saves per-rank predictions to separate JSON files.
         """
         logging.info("Prediction Dumper: Synchronizing between processes")
+
+        if self.online_topk:
+            self.dump = [
+                element.val
+                for image_heap in self._online_heaps.values()
+                for element in image_heap
+            ]
 
         if not self.merge_predictions:
             dumped_file = (
@@ -210,7 +237,15 @@ class PredictionDumper:
             Summary dictionary from summarize().
         """
         dumped_file = self.synchronize_between_processes()
+        # Offline evaluators (LVIS/COCO/TIDE/cgF1) deliberately run only on
+        # rank 0. Without an explicit CPU barrier, other ranks return here and
+        # can enter Trainer's next NCCL all-reduce while rank 0 is still doing
+        # lengthy Python evaluation, eventually triggering the NCCL watchdog.
+        # The shared Gloo group has a 12-hour timeout precisely for this case.
+        needs_main_process_evaluation = self.pred_file_evaluators is not None
         if not is_main_process():
+            if needs_main_process_evaluation:
+                dist.barrier(group=_get_global_gloo_group())
             return {"": 0.0}
 
         meters = {}
@@ -218,6 +253,9 @@ class PredictionDumper:
             for evaluator in self.pred_file_evaluators:
                 results = evaluator.evaluate(dumped_file)
                 meters.update(results)
+
+        if needs_main_process_evaluation:
+            dist.barrier(group=_get_global_gloo_group())
 
         if len(meters) == 0:
             meters = {"": 0.0}
@@ -235,6 +273,7 @@ class PredictionDumper:
     def reset(self):
         """Reset internal state for a new evaluation round."""
         self.dump = []
+        self._online_heaps = defaultdict(list)
 
     def prepare(self, predictions, iou_type):
         """

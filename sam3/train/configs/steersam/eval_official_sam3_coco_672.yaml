@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - /configs/steersam/eval_official_sam3_coco_1008
+  - _self_
+
+# Same evaluation protocol; only resolution, batch and output directory differ.
+paths:
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/eval_official_sam3_coco_val_r672
+
+scratch:
+  resolution: 672
+  val_batch_size: 8

@@ -38,6 +38,7 @@ class PostProcessImage(nn.Module):
         iou_type="bbox",
         to_cpu: bool = True,
         use_original_ids: bool = False,
+        forced_category_id: int | None = None,
         use_original_sizes_box: bool = False,
         use_original_sizes_mask: bool = False,
         convert_mask_to_rle: bool = False,
@@ -55,6 +56,7 @@ class PostProcessImage(nn.Module):
         self.use_presence = use_presence
         self.detection_threshold = detection_threshold
         self.use_original_ids = use_original_ids
+        self.forced_category_id = forced_category_id
         self.use_original_sizes_box = use_original_sizes_box
         self.use_original_sizes_mask = use_original_sizes_mask
 
@@ -277,7 +279,13 @@ class PostProcessImage(nn.Module):
                 img_size_for_boxes,
                 img_size_for_masks,
                 forced_labels=(
-                    meta.original_category_id if self.use_original_ids else None
+                    torch.full_like(
+                        meta.original_category_id, self.forced_category_id
+                    )
+                    if self.forced_category_id is not None
+                    else (
+                        meta.original_category_id if self.use_original_ids else None
+                    )
                 ),
             )
             ids = (
