@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import pkg_resources
@@ -38,6 +39,13 @@ from sam3.model.sam3_image import Sam3Image, Sam3ImageOnVideoMultiGPU
 from sam3.model.sam3_tracking_predictor import Sam3TrackerPredictor
 from sam3.model.sam3_video_inference import Sam3VideoInferenceWithInstanceInteractivity
 from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
+from sam3.model.steering import GatedVisionLanguageAdapter
+from sam3.model.steersam_backbone import SteerSAMVLBackbone
+from sam3.model.steersam_image import SteerSAMImage
+from sam3.model.steersam_neck import SteerSAMViTDetNeck
+from sam3.model.steersam_patch_head import SteerSAMPatchHead
+from sam3.model.steersam_text_encoder import SteerSAMTextEncoder
+from sam3.model.steersam_vit import SteerableViT
 from sam3.model.text_encoder_ve import VETextEncoder
 from sam3.model.tokenizer_ve import SimpleTokenizer
 from sam3.model.vitdet import ViT
@@ -69,9 +77,18 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None, image_size=1008):
+def _create_vit_backbone(
+    compile_mode=None,
+    image_size=1008,
+    enable_steering=False,
+    steering_layers=(7, 15, 23, 31),
+    steering_num_heads=16,
+    steering_head_dim=64,
+    steering_dropout=0.0,
+):
     """Create ViT backbone for visual feature extraction."""
-    return ViT(
+    vit_cls = SteerableViT if enable_steering else ViT
+    return vit_cls(
         img_size=image_size,
         pretrain_img_size=336,
         patch_size=14,
@@ -96,12 +113,28 @@ def _create_vit_backbone(compile_mode=None, image_size=1008):
         return_interm_layers=False,
         bias_patch_embed=False,
         compile_mode=compile_mode,
+        **(
+            dict(
+                steering_layers=tuple(steering_layers),
+                steering_num_heads=steering_num_heads,
+                steering_head_dim=steering_head_dim,
+                steering_dropout=steering_dropout,
+            )
+            if enable_steering
+            else {}
+        ),
     )
 
 
-def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=False):
+def _create_vit_neck(
+    position_encoding,
+    vit_backbone,
+    enable_inst_interactivity=False,
+    enable_steering=False,
+):
     """Create ViT neck for feature pyramid."""
-    return Sam3DualViTDetNeck(
+    neck_cls = SteerSAMViTDetNeck if enable_steering else Sam3DualViTDetNeck
+    return neck_cls(
         position_encoding=position_encoding,
         d_model=256,
         scale_factors=[4.0, 2.0, 1.0, 0.5],
@@ -110,9 +143,10 @@ def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=
     )
 
 
-def _create_vl_backbone(vit_neck, text_encoder):
+def _create_vl_backbone(vit_neck, text_encoder, enable_steering=False):
     """Create visual-language backbone."""
-    return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
+    backbone_cls = SteerSAMVLBackbone if enable_steering else SAM3VLBackbone
+    return backbone_cls(visual=vit_neck, text=text_encoder, scalp=1)
 
 
 def _create_transformer_encoder() -> TransformerEncoderFusion:
@@ -296,6 +330,11 @@ def _create_sam3_model(
     dot_prod_scoring,
     inst_interactive_predictor,
     eval_mode,
+    enable_steering=False,
+    steering_factor=1.0,
+    frozen_pretrained_eval=True,
+    enable_patch_supervision=False,
+    patch_head_zero_init=True,
 ):
     """Create the SAM3 image model."""
     common_params = {
@@ -325,7 +364,20 @@ def _create_sam3_model(
             stable=False,
         )
     common_params["matcher"] = matcher
-    model = Sam3Image(**common_params)
+    if enable_steering:
+        steering_patch_head = (
+            SteerSAMPatchHead(input_dim=1024, zero_init=patch_head_zero_init)
+            if enable_patch_supervision
+            else None
+        )
+        model = SteerSAMImage(
+            steering_factor=steering_factor,
+            frozen_pretrained_eval=frozen_pretrained_eval,
+            steering_patch_head=steering_patch_head,
+            **common_params,
+        )
+    else:
+        model = Sam3Image(**common_params)
 
     return model
 
@@ -486,10 +538,11 @@ def build_tracker(
     return model
 
 
-def _create_text_encoder(bpe_path: str) -> VETextEncoder:
+def _create_text_encoder(bpe_path: str, enable_steering: bool = False):
     """Create SAM3 text encoder."""
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
-    return VETextEncoder(
+    encoder_cls = SteerSAMTextEncoder if enable_steering else VETextEncoder
+    return encoder_cls(
         tokenizer=tokenizer,
         d_model=256,
         width=1024,
@@ -499,19 +552,33 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True, resolution=1008
+    compile_mode=None,
+    enable_inst_interactivity=True,
+    resolution=1008,
+    enable_steering=False,
+    steering_layers=(7, 15, 23, 31),
+    steering_num_heads=16,
+    steering_head_dim=64,
+    steering_dropout=0.0,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
     position_encoding = _create_position_encoding(precompute_resolution=resolution)
     # ViT backbone
     vit_backbone: ViT = _create_vit_backbone(
-        compile_mode=compile_mode, image_size=resolution
+        compile_mode=compile_mode,
+        image_size=resolution,
+        enable_steering=enable_steering,
+        steering_layers=steering_layers,
+        steering_num_heads=steering_num_heads,
+        steering_head_dim=steering_head_dim,
+        steering_dropout=steering_dropout,
     )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
         enable_inst_interactivity=enable_inst_interactivity,
+        enable_steering=enable_steering,
     )
     # Visual neck
     return vit_neck
@@ -527,23 +594,46 @@ def _create_sam3_transformer(
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
 
+@dataclass(frozen=True)
+class CheckpointLoadResult:
+    """Compatibility information collected while loading a model checkpoint."""
+
+    missing_keys: list[str]
+    unexpected_keys: list[str]
+    skipped_dynamic_keys: list[str]
+
+
 def _load_checkpoint(model, checkpoint_path):
-    """Load model checkpoint from file."""
+    """Load a checkpoint and report missing, unexpected and dynamic keys."""
     with g_pathmgr.open(checkpoint_path, "rb") as f:
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
-    if model.inst_interactive_predictor is not None:
-        sam3_image_ckpt.update(
-            {
-                k.replace("tracker.", "inst_interactive_predictor.model."): v
-                for k, v in ckpt.items()
-                if "tracker" in k
-            }
-        )
+    has_released_detector_prefix = any(key.startswith("detector.") for key in ckpt)
+    if has_released_detector_prefix:
+        # Released SAM3 checkpoints wrap the image model under ``detector``
+        # (and optionally the interactive model under ``tracker``).
+        sam3_image_ckpt = {
+            key.removeprefix("detector."): value
+            for key, value in ckpt.items()
+            if key.startswith("detector.")
+        }
+        if model.inst_interactive_predictor is not None:
+            sam3_image_ckpt.update(
+                {
+                    key.replace(
+                        "tracker.", "inst_interactive_predictor.model.", 1
+                    ): value
+                    for key, value in ckpt.items()
+                    if key.startswith("tracker.")
+                }
+            )
+    else:
+        # Trainer checkpoints store the model's state dict directly under the
+        # optional top-level ``model`` key.  Keeping these names unchanged lets
+        # a standalone eval config load a trained SteerSAM checkpoint without
+        # also restoring optimizer/epoch state.
+        sam3_image_ckpt = dict(ckpt)
 
     # RoPE frequencies are registered buffers whose shape depends on the
     # runtime image resolution.  They are regenerated when constructing the
@@ -560,11 +650,66 @@ def _load_checkpoint(model, checkpoint_path):
             f"{skipped_dynamic_keys}"
         )
 
-    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
-    if len(missing_keys) > 0:
+    incompatible_keys = model.load_state_dict(sam3_image_ckpt, strict=False)
+    missing_keys = list(incompatible_keys.missing_keys)
+    unexpected_keys = list(incompatible_keys.unexpected_keys)
+    if missing_keys or unexpected_keys:
         print(
             f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
+            "missing and/or unexpected keys:\n"
+            f"{missing_keys=}\n{unexpected_keys=}"
+        )
+    return CheckpointLoadResult(
+        missing_keys=missing_keys,
+        unexpected_keys=unexpected_keys,
+        skipped_dynamic_keys=skipped_dynamic_keys,
+    )
+
+
+def _validate_steersam_checkpoint_load(
+    result: CheckpointLoadResult, model: Optional[nn.Module] = None
+) -> None:
+    """Reject checkpoint incompatibilities outside SteerSAM's explicit allowlist."""
+
+    skipped_dynamic_keys = set(result.skipped_dynamic_keys)
+    allowed_missing_fragments = ["steering_adapters"]
+    if model is not None and getattr(model, "steering_patch_head", None) is not None:
+        # Released SAM3 and older SteerSAM checkpoints predate the auxiliary
+        # patch head. Its freshly initialized parameters are expected missing
+        # keys when patch supervision is explicitly enabled.
+        allowed_missing_fragments.append("steering_patch_head")
+    unsupported_missing = [
+        key
+        for key in result.missing_keys
+        if not any(fragment in key for fragment in allowed_missing_fragments)
+        and key not in skipped_dynamic_keys
+    ]
+
+    # The released detector checkpoint also contains the optional SAM2 neck.
+    # Image-only SteerSAM deliberately builds without that neck, so those keys
+    # are known checkpoint extras rather than an architecture mismatch.
+    allowed_unexpected_prefixes = ["backbone.vision_backbone.sam2_convs."]
+    if model is not None and getattr(model, "segmentation_head", None) is None:
+        # The released checkpoint contains the optional segmentation head.
+        # Its keys are expected extras only when the requested model genuinely
+        # omits that head; a model that constructed it remains strictly checked.
+        allowed_unexpected_prefixes.append("segmentation_head.")
+    if model is not None and getattr(model, "steering_patch_head", None) is None:
+        # Permit loading a trained SteerSAM checkpoint with the auxiliary head
+        # into an inference build that intentionally disables that head.
+        allowed_unexpected_prefixes.append("steering_patch_head.")
+    unsupported_unexpected = [
+        key
+        for key in result.unexpected_keys
+        if not key.startswith(tuple(allowed_unexpected_prefixes))
+    ]
+
+    if unsupported_missing or unsupported_unexpected:
+        raise RuntimeError(
+            "Loading a SAM3 checkpoint into SteerSAM found unsupported "
+            "incompatibilities: "
+            f"missing={unsupported_missing}, "
+            f"unexpected={unsupported_unexpected}."
         )
 
 
@@ -577,6 +722,56 @@ def _setup_device_and_mode(model, device, eval_mode):
     return model
 
 
+def _log_trainable_parameters(model: nn.Module, enable_steering: bool) -> None:
+    """Print trainable/frozen parameter counts, split by steering adapters."""
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    message = (
+        f"Parameters: {n_total:,} total, {n_train:,} trainable "
+        f"({100.0 * n_train / max(n_total, 1):.2f}%), "
+        f"{n_total - n_train:,} frozen"
+    )
+    if enable_steering:
+        n_adapter = sum(
+            p.numel()
+            for name, p in model.named_parameters()
+            if "steering_adapters" in name
+        )
+        n_adapter_train = sum(
+            p.numel()
+            for name, p in model.named_parameters()
+            if "steering_adapters" in name and p.requires_grad
+        )
+        message += f"; steering adapters {n_adapter_train:,}/{n_adapter:,} trainable"
+        if n_adapter != n_adapter_train:
+            message += " (WARNING: some adapter parameters are frozen)"
+    print(message)
+
+
+def _freeze_sam3_task_modules(model: nn.Module) -> None:
+    """Freeze the pretrained SAM3 task stack after the vision FPN.
+
+    SteerSAM's strategy-2 training policy keeps the prompt-conditioned visual
+    front end trainable (steering adapters, optional patch head, and FPN) but
+    uses the pretrained SAM3 task stack as a fixed readout.  Keeping this as a
+    builder option, rather than hard-coding it in ``SteerSAMImage``, preserves
+    the original SAM3 and full downstream-finetuning behavior by default.
+    """
+    module_names = (
+        "geometry_encoder",
+        "transformer",
+        "dot_prod_scoring",
+        "instance_dot_prod_scoring",
+        "class_embed",
+        "instance_class_embed",
+        "segmentation_head",
+    )
+    for name in module_names:
+        module = getattr(model, name, None)
+        if isinstance(module, nn.Module):
+            module.requires_grad_(False)
+
+
 def build_sam3_image_model(
     bpe_path=None,
     device="cuda" if torch.cuda.is_available() else "cpu",
@@ -586,8 +781,19 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     freeze_vision_backbone=False,
+    freeze_vision_fpn=True,
     freeze_language_backbone=False,
+    freeze_sam3_task_modules=False,
     resolution=1008,
+    enable_steering=False,
+    steering_layers=(7, 15, 23, 31),
+    steering_num_heads=16,
+    steering_head_dim=64,
+    steering_dropout=0.0,
+    steering_factor=1.0,
+    frozen_pretrained_eval=True,
+    enable_patch_supervision=False,
+    patch_head_zero_init=True,
     compile=False,
 ):
     """
@@ -600,14 +806,60 @@ def build_sam3_image_model(
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        freeze_vision_backbone: Disable gradients for the visual backbone.
+        freeze_vision_backbone: Disable gradients for the pretrained visual
+            trunk. By default this also freezes its FPN neck.
+        freeze_vision_fpn: When ``freeze_vision_backbone`` is enabled, also
+            freeze the FPN neck. Set to ``False`` to train the FPN while keeping
+            the pretrained ViT trunk frozen.
         freeze_language_backbone: Disable gradients for the language backbone.
+        freeze_sam3_task_modules: Disable gradients for the pretrained SAM3
+            modules after the vision FPN (geometry encoder, fusion
+            encoder/decoder and their detection heads, scoring modules, and
+            segmentation head). This is off by default. SteerSAM strategy 2
+            enables it so only adapters, the optional patch head, and the FPN
+            remain trainable.
         resolution: Input image resolution used by the visual backbone and decoder.
+        enable_steering: Build the SteerSAM image model (steering adapters in
+            the vision trunk, text-first pair-batch forward). Off by default;
+            the original SAM3 classes and behavior are used otherwise.
+        steering_layers: ViT block indices (0-based, before which) that receive
+            a steering adapter when enable_steering is on.
+        steering_num_heads: Heads per steering adapter.
+        steering_head_dim: Head dimension per steering adapter.
+        steering_dropout: Dropout inside steering adapters.
+        steering_factor: Multiplier on the tanh(alpha) gate at run time.
+        frozen_pretrained_eval: When steering is enabled, keep all-frozen
+            subtrees in eval mode during training (disables e.g. drop-path on
+            the frozen ViT blocks).
+        enable_patch_supervision: Add the SteerViT-style pre-FPN patch
+            localization head. Requires ``enable_steering=True`` and is off by
+            default so the original SAM3 path remains unchanged.
+        patch_head_zero_init: Initialize the shared patch projection to zero,
+            matching SteerViT's localization head initialization.
         compile_mode: To enable compilation, set to "default"
 
     Returns:
         A SAM3 image model
     """
+    steering_layers = tuple(int(i) for i in steering_layers)
+    if enable_patch_supervision and not enable_steering:
+        raise ValueError(
+            "enable_patch_supervision requires enable_steering=True because "
+            "the head consumes prompt-conditioned pre-FPN ViT features."
+        )
+    if enable_steering and compile:
+        raise NotImplementedError(
+            "torch.compile is not supported for the SteerSAM steering path; "
+            "build with compile=False."
+        )
+    if enable_steering and enable_inst_interactivity:
+        # The SAM1-task interactive predictor shares the vision trunk but is
+        # outside the SteerSAM design scope (steersam_design.md section 1);
+        # refuse the untested combination instead of silently mis-steering it.
+        raise NotImplementedError(
+            "enable_inst_interactivity is not supported together with "
+            "enable_steering."
+        )
     if bpe_path is None:
         bpe_path = pkg_resources.resource_filename(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
@@ -619,13 +871,20 @@ def build_sam3_image_model(
         compile_mode=compile_mode,
         enable_inst_interactivity=enable_inst_interactivity,
         resolution=resolution,
+        enable_steering=enable_steering,
+        steering_layers=steering_layers,
+        steering_num_heads=steering_num_heads,
+        steering_head_dim=steering_head_dim,
+        steering_dropout=steering_dropout,
     )
 
     # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = _create_text_encoder(bpe_path, enable_steering=enable_steering)
 
     # Create visual-language backbone
-    backbone = _create_vl_backbone(vision_encoder, text_encoder)
+    backbone = _create_vl_backbone(
+        vision_encoder, text_encoder, enable_steering=enable_steering
+    )
 
     # Create transformer components
     transformer = _create_sam3_transformer(resolution=resolution)
@@ -656,19 +915,45 @@ def build_sam3_image_model(
         dot_prod_scoring,
         inst_predictor,
         eval_mode,
+        enable_steering=enable_steering,
+        steering_factor=steering_factor,
+        frozen_pretrained_eval=frozen_pretrained_eval,
+        enable_patch_supervision=enable_patch_supervision,
+        patch_head_zero_init=patch_head_zero_init,
     )
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf()
     # Load checkpoint if provided
     if checkpoint_path is not None:
-        _load_checkpoint(model, checkpoint_path)
+        checkpoint_result = _load_checkpoint(model, checkpoint_path)
+        if enable_steering:
+            _validate_steersam_checkpoint_load(checkpoint_result, model=model)
 
     # Freeze after checkpoint loading so the pretrained backbone remains intact
     # while autograd can omit its backward graph during fine-tuning.
     if freeze_vision_backbone:
-        model.backbone.vision_backbone.requires_grad_(False)
+        if freeze_vision_fpn:
+            model.backbone.vision_backbone.requires_grad_(False)
+        else:
+            model.backbone.vision_backbone.trunk.requires_grad_(False)
     if freeze_language_backbone:
         model.backbone.language_backbone.requires_grad_(False)
+    if freeze_sam3_task_modules:
+        _freeze_sam3_task_modules(model)
+    if enable_steering:
+        # Freezing the vision backbone also catches the adapters nested in the
+        # trunk; re-enable them explicitly so the steering path can train.
+        n_adapter_modules = 0
+        for module in model.modules():
+            if isinstance(module, GatedVisionLanguageAdapter):
+                module.requires_grad_(True)
+                n_adapter_modules += 1
+        if n_adapter_modules == 0:
+            raise RuntimeError(
+                "enable_steering is on but no steering adapters were found in "
+                "the model."
+            )
+        _log_trainable_parameters(model, enable_steering=True)
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)

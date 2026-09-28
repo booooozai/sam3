@@ -1099,11 +1099,23 @@ class Trainer:
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
 
     def _construct_optimizers(self):
+        param_allowlist = None
+        if getattr(self.model, "steering_enabled", False):
+            # SteerSAM: the optimizer only receives requires_grad=True params
+            # so frozen backbone params get no AdamW state and no param group
+            # can silently zero the adapters' learning rate
+            # (steersam_design.md section 7.9).
+            param_allowlist = {
+                name
+                for name, param in self.model.named_parameters()
+                if param.requires_grad
+            }
         self.optim = construct_optimizer(
             self.model,
             self.optim_conf.optimizer,
             self.optim_conf.options,
             self.optim_conf.param_group_modifiers,
+            param_allowlist=param_allowlist,
         )
 
     def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step):

@@ -37,7 +37,9 @@ class PositionEmbeddingSine(nn.Module):
         self.cache = {}
         # Precompute positional encodings under `precompute_resolution` to fill the cache
         # and avoid symbolic shape tracing errors in torch.compile in PyTorch 2.4 nightly.
-        if precompute_resolution is not None:
+        # The cache is filled lazily on the input's device by `forward` when CUDA is
+        # unavailable (e.g. CPU-only builds/tests), so the precompute is skipped there.
+        if precompute_resolution is not None and torch.cuda.is_available():
             # We precompute pos enc for stride 4, 8, 16 and 32 to fill `self.cache`.
             precompute_sizes = [
                 (precompute_resolution // 4, precompute_resolution // 4),

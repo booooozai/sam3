@@ -167,24 +167,46 @@ def map_scheduler_cfgs_to_param_groups(
 
 
 def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
-    """Check that the param groups are non-overlapping and cover all the parameters.
+    """Check that the param groups are non-overlapping and cover the trainable params.
 
     Args:
         param_groups: List of all param groups
-        model: Model to validate against. The check ensures that all the model
-            parameters are part of param_groups
+        model: Model to validate against. The check ensures that every
+            trainable model parameter (``requires_grad=True``) is part of
+            param_groups exactly once. Groups may additionally contain frozen
+            parameters (``requires_grad=False``): they receive no gradients,
+            so covering them is bookkeeping-only, and the frozen-backbone
+            fine-tuning configs rely on keeping their zero-LR groups.
     """
     for pg in param_groups:
         # no param should be repeated within a group
         assert len(pg["params"]) == len(set(pg["params"]))
     parameters = [set(param_group["params"]) for param_group in param_groups]
     model_parameters = {parameter for _, parameter in model.named_parameters()}
+    trainable_parameters = {
+        parameter
+        for _, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
     for p1, p2 in itertools.permutations(parameters, 2):
         assert p1.isdisjoint(p2), "Scheduler generated param_groups should be disjoint"
-    assert set.union(*parameters) == model_parameters, (
-        "Scheduler generated param_groups must include all parameters of the model."
-        f" Found {len(set.union(*parameters))} params whereas model has"
-        f" {len(model_parameters)} params"
+    if not parameters:
+        assert not trainable_parameters, (
+            "Scheduler generated no param_groups but the model has trainable "
+            "parameters."
+        )
+        return
+    covered_parameters = set.union(*parameters)
+    unknown_parameters = covered_parameters - model_parameters
+    assert not unknown_parameters, (
+        "Scheduler generated param_groups contain parameters that do not "
+        f"belong to the model: {len(unknown_parameters)} params."
+    )
+    missing_parameters = trainable_parameters - covered_parameters
+    assert not missing_parameters, (
+        "Scheduler generated param_groups must include every trainable "
+        f"parameter of the model. {len(missing_parameters)} trainable params "
+        "are not covered by any param group."
     )
 
 

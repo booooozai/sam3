@@ -272,7 +272,14 @@ class TransformerDecoder(nn.Module):
             self.compilable_stored_size = None
             self.coord_cache = {}
 
-            if resolution is not None and stride is not None:
+            if (
+                resolution is not None
+                and stride is not None
+                and torch.cuda.is_available()
+            ):
+                # Pre-fill the compilable coord cache on CUDA only; on
+                # CPU-only builds `_get_rpb_matrix` fills the dict-based
+                # `coord_cache` lazily on the input's device instead.
                 feat_size = resolution // stride
                 coords_h, coords_w = self._get_coords(
                     feat_size, feat_size, device="cuda"
