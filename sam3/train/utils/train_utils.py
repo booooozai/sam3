@@ -147,10 +147,25 @@ def log_env_variables():
     env_keys = sorted(list(os.environ.keys()))
     st = ""
     for k in env_keys:
-        v = os.environ[k]
+        v = "<redacted>" if _is_sensitive_env_variable(k) else os.environ[k]
         st += f"{k}={v}\n"
     logging.info("Logging ENV_VARIABLES")
     logging.info(st)
+
+
+def _is_sensitive_env_variable(name: str) -> bool:
+    """Return whether an environment variable may contain credentials."""
+    upper_name = name.upper()
+    sensitive_markers = (
+        "API_KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "PASSWORD",
+        "PASSWD",
+        "SECRET",
+        "TOKEN",
+    )
+    return any(marker in upper_name for marker in sensitive_markers)
 
 
 class AverageMeter:
