@@ -1,0 +1,399 @@
+# @package _global_
+defaults:
+  - _self_
+
+# @note Standalone six-source SteerSAM configuration. Build the pair index first.
+paths:
+  coco_root: /home/chenshengbo/workspace/sam3/data/coco
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/steersam_six_dataset
+  bpe_path: /home/chenshengbo/workspace/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  checkpoint_path: /home/chenshengbo/workspace/sam3/pretrained_weights/sam3/sam3.pt
+# Shared transforms and task loss for the six-source pair index.
+coco_train:
+  # Shared transforms and task loss; the six-source pair index defines samples.
+
+  # Training transforms pipeline
+  train_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+          query_filter:
+            _target_: sam3.train.transforms.filter_query_transforms.FilterCrowds
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes:
+            _target_: sam3.train.transforms.basic.get_random_resize_scales
+            size: ${scratch.resolution}
+            min_size: 480
+            rounded: false
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: ${scratch.consistent_transform}
+        - _target_: sam3.train.transforms.basic_for_api.PadToSizeAPI
+          size: ${scratch.resolution}
+          consistent_transform: ${scratch.consistent_transform}
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+          query_filter:
+            _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.train_norm_mean}
+          std: ${scratch.train_norm_std}
+    - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+      query_filter:
+        _target_: sam3.train.transforms.filter_query_transforms.FilterFindQueriesWithTooManyOut
+        max_num_objects: ${scratch.max_ann_per_img}
+
+  # Validation transforms pipeline
+  val_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: False
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.train_norm_mean}
+          std: ${scratch.train_norm_std}
+
+  # Joint box, classification, instance-mask, and semantic-mask losses.
+  loss:
+    _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+    matcher: ${scratch.matcher}
+    o2m_weight: 2.0
+    o2m_matcher:
+      _target_: sam3.train.matcher.BinaryOneToManyMatcher
+      alpha: 0.3
+      threshold: 0.4
+      topk: 4
+    use_o2m_matcher_on_o2m_aux: false # Another option is true
+    loss_fns_find:
+      - _target_: sam3.train.loss.loss_fns.Boxes
+        weight_dict:
+          loss_bbox: 5.0
+          loss_giou: 2.0
+      - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+        weak_loss: False
+        weight_dict:
+          loss_ce: 20.0 # Another option is 100.0
+          presence_loss: 20.0
+        pos_weight: 10.0 # Another option is 5.0
+        alpha: 0.25
+        gamma: 2
+        use_presence: True # Change
+        pos_focal: false
+        pad_n_queries: 200
+        pad_scale_pos: 1.0
+      - _target_: sam3.train.loss.loss_fns.Masks
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        weight_dict:
+          loss_mask: 200.0
+          loss_dice: 10.0
+        compute_aux: false
+
+    loss_fn_semantic_seg:
+      _target_: sam3.train.loss.loss_fns.SemanticSegCriterion
+      presence_head: true
+      presence_loss: false
+      focal: true
+      focal_alpha: 0.6
+      focal_gamma: 2.0
+      downsample: false
+      weight_dict:
+        loss_semantic_seg: 20.0
+        loss_semantic_presence: 1.0
+        loss_semantic_dice: 30.0
+    scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
+
+# ============================================================================
+# Different helper parameters and functions
+# ============================================================================
+scratch:
+  enable_segmentation: true
+  # Matcher configuration
+  matcher:
+    _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+    focal: true # with `focal: true` it is equivalent to BinaryFocalHungarianMatcher
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    alpha: 0.25
+    gamma: 2
+    stable: False
+  scale_by_find_batch_size: True
+
+  # Image processing parameters
+  resolution: 1008
+  consistent_transform: False
+  max_ann_per_img: 200
+
+  # Normalization parameters
+  train_norm_mean: [0.5, 0.5, 0.5]
+  train_norm_std: [0.5, 0.5, 0.5]
+
+  # Training parameters
+  num_train_workers: 10
+  num_val_workers: 10
+  hybrid_repeats: 1
+  # The model's VETextEncoder uses a fixed 32-token context. The index rejects longer text.
+  pair_index: /home/chenshengbo/workspace/sam3/data/steersam_pairs/pairs.sqlite
+  pair_data_root: /home/chenshengbo/workspace/sam3/data
+  pair_selection_seed: 123
+  max_train_pairs:
+    # coco: null
+    # lvis: null
+    # refcoco: null
+    # refcoco_plus: null
+    # refcocog: null
+    # phrasecut: null
+    coco: 32000
+    lvis: 48000
+    refcoco: 32000
+    refcoco_plus: 48000
+    refcocog: null
+    phrasecut: 80000
+
+  # Learning rate and scheduler parameters.
+  # The pretrained FPN uses a conservative fine-tuning learning rate.
+  lr_scale: 0.01
+  lr_fpn: ${times:8e-4,${scratch.lr_scale}}
+  # The steering adapters start from random init, so they need a higher LR
+  # than the pretrained heads. SteerViT used 3e-4; 1e-4 with the shared
+  # warmup/cooldown is the ablation starting point (steersam_design.md 7.9).
+  lr_steer_adapter: 1e-4
+  wd: 0.1
+  scheduler_timescale: 20
+  scheduler_warmup: 20
+  scheduler_cooldown: 20
+
+  # Steering adapter settings (mirrored in model params below).
+  steering_layers: [7, 15, 23, 31]
+  enable_patch_supervision: true
+  patch_loss_weight: 0.1
+
+  # A strategy-2 smoke at physical batch 16 used about 21 GB/card for train
+  # and 8 GB/card for validation on A100 40GB. The trainer only
+  # accepts gradient_accumulation_steps > 1 when the collator returns a list of
+  # chunks, so the standard collator intentionally uses accumulation=1.
+  val_batch_size: 15
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: default
+    with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
+
+  gradient_accumulation_steps: 1
+  train_batch_size: 15
+  collate_fn:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: all
+    with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
+
+# ============================================================================
+# Trainer Configuration
+# ============================================================================
+
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  skip_saving_ckpts: false
+  empty_gpu_mem_cache_after_eval: True
+  skip_first_val: True
+  max_epochs: 100
+  accelerator: cuda
+  seed_value: 123
+  val_epoch_freq: 100
+  mode: train
+  gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: True
+    gradient_as_bucket_view: True
+
+  loss:
+    all:
+      _target_: sam3.train.loss.steersam_patch_loss.SteerSAMPatchLossWrapper
+      task_loss: ${coco_train.loss}
+      patch_loss_weight: ${scratch.patch_loss_weight}
+    # Eval-mode SAM3 omits Hungarian matching indices, so internal validation
+    # computes only the directly supervised patch loss and PMASS.
+    default:
+      _target_: sam3.train.loss.steersam_patch_loss.SteerSAMPatchLossWrapper
+      task_loss: null
+      patch_loss_weight: ${scratch.patch_loss_weight}
+
+  data:
+    train:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        coco_json_loader:
+          _target_: sam3.train.data.unified_pair_loader.UnifiedPositivePairFromSQLite
+          _partial_: true
+          split: train
+          max_train_pairs: ${scratch.max_train_pairs}
+          selection_seed: ${scratch.pair_selection_seed}
+        img_folder: ${scratch.pair_data_root}
+        ann_file: ${scratch.pair_index}
+        transforms: ${coco_train.train_transforms}
+        load_segmentation: true
+        max_ann_per_img: ${scratch.max_ann_per_img}
+        multiplier: 1
+        training: true
+        use_caching: false
+      shuffle: true
+      batch_size: ${scratch.train_batch_size}
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: true
+      drop_last: true
+      collate_fn: ${scratch.collate_fn}
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        coco_json_loader:
+          _target_: sam3.train.data.unified_pair_loader.UnifiedPositivePairFromSQLite
+          _partial_: true
+          split: val
+        img_folder: ${scratch.pair_data_root}
+        ann_file: ${scratch.pair_index}
+        transforms: ${coco_train.val_transforms}
+        load_segmentation: true
+        max_ann_per_img: ${scratch.max_ann_per_img}
+        multiplier: 1
+        training: false
+        use_caching: false
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+
+  model:
+    _target_: sam3.model_builder.build_sam3_image_model
+    bpe_path: ${paths.bpe_path}
+    checkpoint_path: ${paths.checkpoint_path}
+    load_from_HF: false
+    device: cpus
+    eval_mode: false
+    resolution: ${scratch.resolution}
+    enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
+    # Strategy 2: train only adapters, patch head, and FPN. The pretrained
+    # ViT/text towers and the complete post-FPN SAM3 task stack are fixed.
+    enable_steering: true
+    steering_layers: ${scratch.steering_layers}
+    steering_num_heads: 16
+    steering_head_dim: 64
+    steering_dropout: 0.0
+    steering_factor: 1.0
+    enable_patch_supervision: ${scratch.enable_patch_supervision}
+    patch_head_zero_init: true
+    frozen_pretrained_eval: true
+    freeze_vision_backbone: true
+    # Freeze the pretrained ViT trunk but train the FPN that adapts steered
+    # 1024-d tokens to SAM3's 256-d detector feature space.
+    freeze_vision_fpn: false
+    freeze_language_backbone: true
+    freeze_sam3_task_modules: true
+
+  # The mixed internal val only reports supervised patch loss and PMASS.
+  # Formal dataset metrics use the existing source-specific official evaluators.
+  meters: null
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: sam3.train.optim.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    # The trainer passes a trainable-only param allowlist for steering models,
+    # so the frozen backbones' zero-LR groups from the baseline config are
+    # intentionally absent here: they would match no trainable parameter.
+    param_group_modifiers: []
+
+    options:
+      lr:
+        - scheduler: # trainable FPN (all post-FPN SAM3 task modules are frozen)
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_fpn}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+        - scheduler: # steering adapters, gates, and pre-FPN patch head
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_steer_adapter}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - "*steering_adapters*"
+            - "*steering_patch_head*"
+
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: ${scratch.wd}
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - "*bias*"
+          module_cls_names: ["torch.nn.LayerNorm"]
+        - scheduler: # never decay the zero-initialized gates toward zero output
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - "*steering_adapters*.alpha"
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 1 # 0 only last checkpoint is saved.
+
+  logging:
+    tensorboard_writer:
+      _target_: sam3.train.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: True
+    wandb_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs/six_dataset_mask
+    log_freq: 10
+
+# ============================================================================
+# Launcher and Submitit Configuration
+# ============================================================================
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 2
+  experiment_log_dir: ${paths.experiment_log_dir}
+  multiprocessing_context: forkserver
+
+submitit:
+  account: null
+  partition: null
+  qos: null
+  timeout_hour: 72
+  use_cluster: False
+  cpus_per_task: 10
+  port_range: [10000, 65000]
+  constraint: null

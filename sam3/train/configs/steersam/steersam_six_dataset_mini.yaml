@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - /configs/steersam/steersam_six_dataset
+  - _self_
+
+# Small experiment, not the historical 2-pair smoke. Resource/checkpoint
+# settings inherit the main config; its filtered val is not a formal metric.
+paths:
+  experiment_log_dir: /share/Pub_Datasets/chenshengbo/outputs/steersam_six_dataset_mini
+
+scratch:
+  max_train_pairs:
+    coco: 200
+    lvis: 200
+    refcoco: 200
+    refcoco_plus: 200
+    refcocog: 200
+    phrasecut: 200
+
+trainer:
+  max_epochs: 10
+  data:
+    val:
+      dataset:
+        limit_ids: 60

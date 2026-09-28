@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - /configs/steersam/steersam_six_dataset
+  - _self_
+
+# Internal filtered validation only, not the source's official evaluation.
+# Loads the latest SteerSAM training checkpoint from the parent's save_dir.
+trainer:
+  mode: val
+  checkpoint:
+    resume_from: ${launcher.experiment_log_dir}/checkpoints/checkpoint.pt
+  data:
+    val:
+      dataset:
+        coco_json_loader:
+          source: refcocog
+  logging:
+    log_dir: ${launcher.experiment_log_dir}/logs/internal_val_refcocog
+    tensorboard_writer:
+      should_log: false
