@@ -224,9 +224,9 @@ def main(args) -> None:
             },
         }
         if "include_nodes" in submitit_conf:
-            assert len(submitit_conf["include_nodes"]) >= cfg.launcher.num_nodes, (
-                "Not enough nodes"
-            )
+            assert (
+                len(submitit_conf["include_nodes"]) >= cfg.launcher.num_nodes
+            ), "Not enough nodes"
             job_kwargs["slurm_additional_parameters"]["nodelist"] = " ".join(
                 submitit_conf["include_nodes"]
             )

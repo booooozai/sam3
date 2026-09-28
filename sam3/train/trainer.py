@@ -209,9 +209,9 @@ class Trainer:
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
         log_env_variables()
 
-        assert is_dist_avail_and_initialized(), (
-            "Torch distributed needs to be initialized before calling the trainer."
-        )
+        assert (
+            is_dist_avail_and_initialized()
+        ), "Torch distributed needs to be initialized before calling the trainer."
 
         self._setup_components()  # Except Optimizer everything is setup here.
         self._move_to_device()
@@ -221,9 +221,9 @@ class Trainer:
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
 
         if self.checkpoint_conf.resume_from is not None:
-            assert os.path.exists(self.checkpoint_conf.resume_from), (
-                f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
-            )
+            assert os.path.exists(
+                self.checkpoint_conf.resume_from
+            ), f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
             dst = os.path.join(self.checkpoint_conf.save_dir, "checkpoint.pt")
             if self.distributed_rank == 0 and not os.path.exists(dst):
                 # Copy the "resume_from" checkpoint to the checkpoint folder
@@ -471,9 +471,9 @@ class Trainer:
             return self.loss[key]
 
         assert key != "all", "Loss must be specified for key='all'"
-        assert "default" in self.loss, (
-            f"Key {key} not found in losss, and no default provided"
-        )
+        assert (
+            "default" in self.loss
+        ), f"Key {key} not found in losss, and no default provided"
         return self.loss["default"]
 
     def _find_meter(self, phase: str, key: str):
@@ -916,12 +916,12 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
 
         if self.gradient_accumulation_steps > 1:
-            assert isinstance(batch, list), (
-                f"Expected a list of batches, got {type(batch)}"
-            )
-            assert len(batch) == self.gradient_accumulation_steps, (
-                f"Expected {self.gradient_accumulation_steps} batches, got {len(batch)}"
-            )
+            assert isinstance(
+                batch, list
+            ), f"Expected a list of batches, got {type(batch)}"
+            assert (
+                len(batch) == self.gradient_accumulation_steps
+            ), f"Expected {self.gradient_accumulation_steps} batches, got {len(batch)}"
             accum_steps = len(batch)
         else:
             accum_steps = 1
@@ -1033,9 +1033,9 @@ class Trainer:
     def _check_val_key_match(self, val_keys, phase):
         if val_keys is not None:
             # Check if there are any duplicates
-            assert len(val_keys) == len(set(val_keys)), (
-                f"Duplicate keys in val datasets, keys: {val_keys}"
-            )
+            assert len(val_keys) == len(
+                set(val_keys)
+            ), f"Duplicate keys in val datasets, keys: {val_keys}"
 
             # Check that the keys match the meter keys
             if self.meters_conf is not None and phase in self.meters_conf:
@@ -1049,9 +1049,9 @@ class Trainer:
                 loss_keys = set(self.loss_conf.keys()) - set(["all"])
                 if "default" not in loss_keys:
                     for k in val_keys:
-                        assert k in loss_keys, (
-                            f"Error: key {k} is not defined in the losses, and no default is set"
-                        )
+                        assert (
+                            k in loss_keys
+                        ), f"Error: key {k} is not defined in the losses, and no default is set"
 
     def _setup_components(self):
         # Get the keys for all the val datasets, if any
