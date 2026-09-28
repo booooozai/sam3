@@ -1,4 +1,4 @@
-version: "1.1"
+version: "1.4"
 
 figure:
   title: "From SteerViT to SteerSAM"
@@ -24,20 +24,26 @@ metadata:
     - "sam3/model/vl_combiner.py"
     - "sam3/model/encoder.py"
     - "sam3/model/sam3_image.py"
+    - "sam3/model/steersam_patch_head.py"
+    - "sam3/train/loss/steersam_patch_loss.py"
     - "sam3/model_builder.py"
     - "sam3/train/data/coco_json_loaders.py"
     - "sam3/train/configs/coco/coco2017_full_ft_mask_frozen_backbone.yaml"
+    - "sam3/train/configs/coco/coco2017_steersam_mask.yaml"
   unresolved:
-    - "SteerSAM is a proposed architecture; insertion layers and pair-batch policy require ablation."
+    - "SteerSAM strategy 2 is implemented; the strict FPN-frozen and full downstream-finetuning variants remain ablations."
     - "The conservative enabled default uses four global-block adapters, but 1/2/4/8/16-layer injection densities require ablation."
   scope:
     pipeline: "image-only"
     video_pipeline: "out-of-scope and unchanged"
     steering_default_enabled: false
     image_resolution: 672
-    coco_primary_training: "positive-only image-category pairs"
-    positive_pair_loader: "COCOPositivePairFromJSON"
+    resolution_note: "reference shapes only; runtime resolution comes from the experiment YAML"
+    coco_primary_training: "six-source positive-only image-query pairs; COCO JSON remains a legacy regression path"
+    positive_pair_loader: "UnifiedPositivePairFromSQLite"
     dataset_scaling: "positive pairs scale with annotations rather than image_count x category_count"
+    train_time_validation: "positive-only patch SoftCE/PMASS via UnifiedPositivePairFromSQLite; no Hungarian matching required"
+    standalone_evaluation: "COCOAllCategoryPairsFromJSON for trained SteerSAM COCO AP; no default prompt-pair metrics; original protocols for other benchmarks"
 
 panels:
   - id: steervit
@@ -45,7 +51,7 @@ panels:
     title: "SteerViT: implemented source path"
   - id: steersam
     label: "(b)"
-    title: "SteerSAM: proposed image-training path"
+    title: "SteerSAM: implemented image-training path"
   - id: adapter
     label: "(c)"
     title: "Proposed gated steering adapter"
@@ -120,12 +126,12 @@ nodes:
     label: "Image-prompt pair batch"
     role: "preprocess"
     kind: "operator"
-    shape: "P positive pairs from COCOPositivePairFromJSON"
+    shape: "P positive image-query pairs from UnifiedPositivePairFromSQLite"
     panel: steersam
     details:
-      - "The loader indexes distinct positive (image, category) pairs directly from annotations; it exposes neither category chunking nor negative sampling."
-      - "All instances of the selected category remain grouped in the pair target."
-      - "A batch has P equal to the number of image rows and img_ids=arange(P); source images may repeat across positive categories."
+      - "The SQLite loader reads prevalidated positive image-query pairs from six sources; it exposes neither category chunking nor negative sampling."
+      - "COCO/LVIS group valid category instances; referring datasets retain the target instances of each expression."
+      - "A batch has P equal to the number of image rows and img_ids=arange(P); source images may repeat across queries."
       - "Positive-only indexing scales to large-vocabulary datasets such as LVIS without constructing image_count x category_count records."
   - id: ss_image
     label: "Image"
@@ -176,27 +182,48 @@ nodes:
       - "Required ablations: 1, 2, 4, 8, and 16 adapters."
       - "Only adapters and gates inside the frozen trunk remain trainable."
   - id: ss_fpn
-    label: "SimpleFPN + scalp=1"
+    label: "Trainable SimpleFPN interface + scalp=1"
     role: "representation"
     kind: "module"
     shape: "P x 256 x {192,96,48}^2; 24x24 removed by scalp=1"
     panel: steersam
+    details:
+      - "Strategy 2 freezes the ViT trunk and post-FPN SAM3 task stack but trains the FPN (freeze_vision_fpn=false)."
+      - "freeze_vision_fpn=true is retained as an ablation and backward-compatible default."
+  - id: ss_patch_head
+    label: "Zero-init pre-FPN patch head"
+    role: "head"
+    kind: "module"
+    shape: "shared 1x1 Conv: 1024 -> 1; logits P x 48 x 48"
+    panel: steersam
+  - id: ss_patch_target
+    label: "Query-target instance union mask"
+    role: "target"
+    kind: "data"
+    shape: "P x 672 x 672 -> adaptive pool -> P x 48 x 48"
+    panel: steersam
+  - id: ss_patch_loss
+    label: "Spatial SoftCE + PMASS"
+    role: "loss"
+    kind: "module"
+    shape: "L_total = L_SAM3 + 0.1 L_patch"
+    panel: steersam
   - id: ss_late_fusion
-    label: "Existing 6-layer fusion encoder"
+    label: "Frozen existing 6-layer fusion encoder"
     role: "fusion"
     kind: "module"
     shape: "image: 2304 x P x 256; prompt: Lp x P x 256"
     repeat: 6
     panel: steersam
   - id: ss_decoder
-    label: "Existing DETR-like decoder"
+    label: "Frozen existing DETR-like decoder"
     role: "head"
     kind: "module"
     shape: "6 layers; 200 object queries; d=256"
     repeat: 6
     panel: steersam
   - id: ss_heads
-    label: "Box, score, presence, mask heads"
+    label: "Frozen box, score, presence, mask heads"
     role: "head"
     kind: "module"
     panel: steersam
@@ -267,6 +294,10 @@ edges:
   - {from: ss_image, to: ss_patch_embed, type: main}
   - {from: ss_patch_embed, to: ss_vit, type: main}
   - {from: ss_text_tap, to: ss_vit, type: conditioning, label: "early steering K,V"}
+  - {from: ss_vit, to: ss_patch_head, type: training, label: "pre-FPN feature"}
+  - {from: ss_pair_contract, to: ss_patch_target, type: training, label: "all valid targets of query"}
+  - {from: ss_patch_head, to: ss_patch_loss, type: training, label: "patch logits"}
+  - {from: ss_patch_target, to: ss_patch_loss, type: training, label: "normalized occupancy"}
   - {from: ss_vit, to: ss_fpn, type: main}
   - {from: ss_fpn, to: ss_late_fusion, type: main}
   - {from: ss_resizer, to: ss_late_fusion, type: conditioning, label: "existing late fusion"}
@@ -291,10 +322,10 @@ annotations:
 groups:
   - id: frozen_modules
     label: "Frozen pretrained modules"
-    node_ids: [sv_roberta, sv_patch_embed, ss_text_encoder, ss_resizer, ss_patch_embed]
+    node_ids: [sv_roberta, sv_patch_embed, ss_text_encoder, ss_resizer, ss_patch_embed, ss_late_fusion, ss_decoder, ss_heads]
   - id: trainable_steering
-    label: "Trainable steering path"
-    node_ids: [sv_connector, sv_seg_head, ad_cross_attention, ad_gate]
+    label: "Trainable conditioned visual front end"
+    node_ids: [sv_connector, sv_seg_head, ss_fpn, ss_patch_head, ad_cross_attention, ad_gate]
 
 style:
   compact: false

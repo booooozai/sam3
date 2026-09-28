@@ -1,9 +1,11 @@
 # 从 SteerViT 到 SteerSAM：架构分析与实现指南
 
-> 文档状态：设计提案（positive-pair data loader 已实现，SteerSAM 模型尚未实现）
-> 适用范围：当前仓库的 SAM3 **图像模型（image pipeline）**与 COCO 微调流程；不包含 video pipeline
+> 文档状态：SteerSAM image-only 策略二已实现；当前主方案只训练 steering adapters、pre-FPN patch head 和 FPN；正式 COCO 指标实验待执行
+> 适用范围：SAM3 **图像模型（image pipeline）**；六数据集训练主入口见 [数据链路文档](./steersam_six_dataset.md)，COCO 示例用于架构说明；不包含 video pipeline
 > 源码基线：本文以本地 `sam3/` 和 `SteerViT/` 源码为准；论文用于解释设计动机和交叉验证
 > 最后核对日期：2026-09-24（已包含提交 `299429c` 的 COCO 空 query 过滤语义）
+
+> 工作流更新：2026-09-28。默认训练数据入口已改为 `UnifiedPositivePairFromSQLite`；本文 672/COCO shape 示例不限制模型可配置分辨率。正式 COCO 只输出 bbox/mask AP，旧 LVIS 虚拟 pair cgF1 已移除。可运行入口与历史实验边界见 [steersam_workflows.md](./steersam_workflows.md)。
 
 ## 1. 目标与结论先行
 
@@ -21,10 +23,11 @@
 - 开启后，在可配置的 `steering_layers` 前插入零门控的 image-to-text cross-attention adapter；保守默认值为 4 个 global-attention block：`[7, 15, 23, 31]`，但必须消融更多注入密度；
 - adapter 中视觉 token 是 query，文本 token 是 key/value；
 - SAM3 原有的 `resizer: 1024 -> 256`、fusion encoder、decoder 和 mask head 全部保留；
-- 冻结两个预训练 backbone 的原有参数，只训练新 adapter、gate 以及当前任务相关的非 backbone 模块；
-- SteerSAM image data pipeline 使用专用的 `COCOPositivePairFromJSON`，直接从标注构建正 `(image, category)` pair；它不暴露 `include_negatives` 或 `category_chunk_size`，从数据合约上保证每条 record 只有一个正 prompt。物理 batch size 按显存选择，较大的 effective batch 优先通过梯度累积实现。
+- 最终 prompt-aware ViT feature 在进入 FPN 前接一个零初始化的共享 `Linear(1024,1)` 等价 patch head，以类别实例 union mask 提供直接空间监督；
+- 冻结两个预训练 backbone 的原有参数和 post-FPN SAM3 任务栈；只训练新 adapter、gate、patch head 与负责接入条件视觉特征的 FPN；
+- 当前主训练使用 `UnifiedPositivePairFromSQLite` 读取六数据集正 image–query pair，类别名与指代表达使用同一接口，每条 record 只有一个正 prompt。`COCOPositivePairFromJSON` 保留用于 COCO 历史实验、baseline 和测试。标准 collator 的梯度累积必须保持 1；增大 effective batch 需要配套实现返回 micro-batch list 的 collator，不能只改累积参数。
 
-这不是无风险的“必然增强”。SteerViT 的实验证据说明 early language steering 对细粒度、指称性视觉特征有价值，但 SAM3 已经有很强的 late fusion 和 prompt-grounding 能力。SteerSAM 是否提高 COCO 检测/分割指标，必须通过严格消融实验验证。
+这一设计形成一条清晰主线：文本先决定 ViT 应突出哪些 patch，FPN 再把 prompt-aware 表示传播到多个尺度，SAM3 原有任务头最终输出 boxes 和 masks。实验验证是后续工作，不改变这一架构职责划分。
 
 ---
 
@@ -315,11 +318,11 @@ flowchart LR
 | `tanh(alpha)`，`alpha=0` | 直接借鉴 | 初始化与原 SAM3 等价，降低破坏预训练特征的风险 |
 | 每隔一个 DINO block 注入 | 转为可配置消融 | SAM3 有 32 层且分 window/global attention；4 个 global block 是保守默认，但 8/16 层方案必须实验比较 |
 | RoBERTa `1024 -> 768` connector | 不照搬 | SAM3 contextual text 和 vision hidden 都是 1024；无维度不匹配 |
-| 独立 linear patch head | 第一版不照搬 | SAM3 已有成熟检测、presence、instance/semantic mask 监督，可直接训练 steering |
+| 独立 linear patch head | 直接借鉴并适配 | 放在最终 ViT feature 与 FPN 之间，以类别全部实例的 union mask 提供 steering 专属的空间监督；不替换 SAM3 原 loss |
 | 单个图文 pair 的 backbone forward | 需要适配数据管线 | SAM3 当前允许一图多 prompt 并复用图像特征；early steering 后此复用不再成立 |
 | monkey-patch timm block | 不照搬 | SAM3 自有 `ViT`/`Block`，应使用显式模块和参数，利于 checkpoint、导出和测试 |
 | 可选 gated FFN | 第一版不采用 | SteerViT 消融不支持其必要性，且会显著增加参数和显存 |
-| 指称分割 soft-CE | 后续可选辅助项 | 可能强化空间 steering，但第一版应先检验现有 SAM3 losses 是否足够 |
+| 指称分割 soft-CE | 直接借鉴并适配 | COCO 一条 pair 对应一个类别，target 使用该类别全部有效实例 mask 的并集 |
 
 ### 5.1 late fusion 会不会与 SteerViT 思想冲突
 
@@ -359,18 +362,24 @@ flowchart LR
     PE --> V[32 frozen ViT blocks<br/>+ trainable steering adapters]
     CT -. K,V at 7/15/23/31 .-> V
     V --> VF[Prompt-aware visual feature<br/>P x 48 x 48 x 1024]
+    VF --> PH[Zero-init patch head<br/>1024 -> 1]
+    PH --> PL[Patch logits P x 48 x 48<br/>SoftCE against union-mask distribution]
     VF --> FPN[SimpleFPN + scalp=1<br/>P x 256 x 192/96/48]
 
-    FPN --> FE[Existing fusion encoder x6<br/>2304 x P x 256]
+    FPN --> FE[Frozen existing fusion encoder x6<br/>2304 x P x 256]
     RS -. existing late fusion .-> FE
-    FE --> DE[Existing decoder x6<br/>200 queries, d=256]
+    FE --> DE[Frozen existing decoder x6<br/>200 queries, d=256]
     RS -. prompt tokens .-> DE
-    DE --> HD[Existing box / score / presence heads]
-    FPN --> MH[Existing segmentation head]
+    DE --> HD[Frozen box / score / presence heads]
+    FPN --> MH[Frozen existing segmentation head]
     DE --> MH
     HD --> O[Prompt-conditioned predictions]
     MH --> O
 ```
+
+这里 FPN 的四个原始输出分别为 `192/96/48/24`，`scalp=1` 丢弃最低分辨率的 `24 x 24` 层。检测 fusion encoder 使用保留层中的 `48 x 48` 层；分割 PixelDecoder 自顶向下融合保留的 `48/96/192` 三层。steering 和 patch head 都位于 FPN 之前，因此一次语言条件化会自然传播到三层任务特征，而 patch loss 不会把直接梯度归因给 FPN。策略二让 FPN 学习将这类条件视觉特征映射到 SAM3 的 256 维多尺度空间，同时把后续任务栈固定为预训练 readout。
+
+这一位置选择也区分了三种可能的监督粒度：image-level 在 positive-only 数据上容易退化成恒正预测；pixel-level 与 SAM3 已有 mask loss 高度重叠；patch-level 与 ViT steering 的计算粒度完全一致，且图像中的非目标 patch 已提供空间负例，因此被选为当前主方案。
 
 ### 6.2 Adapter 内部结构
 
@@ -474,15 +483,16 @@ pair 1 -> image A + "bicycle"  # 必须得到另一份 backbone 输出
 pair 2 -> image B + "dog"
 ```
 
-对于 SteerSAM image pipeline，默认数据合约由专用 loader 表达：
+对于当前 SteerSAM image pipeline，默认数据合约由六来源专用 loader 表达：
 
 ```yaml
 coco_json_loader:
-  _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
+  _target_: sam3.train.data.unified_pair_loader.UnifiedPositivePairFromSQLite
   _partial_: true
+  split: train
 ```
 
-`COCOPositivePairFromJSON` 不暴露 `include_negatives` 和 `category_chunk_size`，因此不存在忘记将某个参数设为 `false` 或 `1` 而破坏 pair 语义的情况。它直接从 annotation 表建立**正 image-category pair 数据集**，不枚举无标注类别，也不构建 `image_count x category_count` 的中间索引。在当前每条 record 仅含一张图和一条 query 的前提下，一个 DataLoader batch 满足：
+`UnifiedPositivePairFromSQLite` 读取离线筛选后的正 image–query pair，不暴露 `include_negatives` 和 `category_chunk_size`。COCO/LVIS 的 query 是类别名，对应该类别的全部有效标注实例；RefCOCO/+/g 和 PhraseCut 的 query 是表达或短语，对应表达指向的一个或多个目标。历史 `COCOPositivePairFromJSON` 则直接从 COCO annotation 表建立正 image-category pair；两种 loader 都不枚举无标注类别，也不构建 `image_count x category_count` 中间索引。在每条 record 仅含一张图和一条 query 的前提下，一个 DataLoader batch 满足：
 
 ```text
 P = number_of_image_rows = physical_batch_size
@@ -497,13 +507,23 @@ img_ids = [0, 1, ..., P-1]
 - 数据集长度从“有效图像记录数”变为“正 image-category pair 总数”，扩大倍数与每张图的正类别数有关，不是固定 80 倍；
 - 同一源图像的不同 records 可能接受不同随机增强，因此不严格等价于在同一增强图像上联合处理全部正类别；
 - 物理 batch size 只决定每步处理多少个 pair；它是显存和吞吐的超参数，不是 pair 语义的正确性开关；
-- 若显存不足，应降低物理 batch size，并通过 gradient accumulation 恢复目标 effective batch。
+- 若显存不足，先降低物理 batch size；当前标准 collator 必须保持 `gradient_accumulation_steps=1`。若需梯度累积恢复目标 effective batch，必须先实现返回 micro-batch list 的 collator。
 
 因此，pair 拆分由 loader 的索引方式解决；增大 batch size 不是正确性的必要条件，也不能恢复原先的共享视觉计算或完全相同的采样过程。frozen-backbone YAML 中的 train/val physical batch size 只是 baseline 的吞吐调优参数；接入 SteerSAM adapter 后必须重新测量，不应盲目继承。
 
 专用 loader 将 positive-only 行为固化为默认且唯一的语义。它的数据集规模跟随实际标注的正 image-category pairs，而不是 `N_images x C` 笛卡尔积，因而更适合扩展到 LVIS 等大词表数据集。通用 `COCO_FROM_JSON` 的既有默认行为保持不变，避免影响其他 SAM3 数据配置。
 
-因此，当前 SteerSAM 设计、训练配置、测试和实验方案统一按 positive-only 数据处理，不增加其他类别组合分支。
+因此，SteerSAM 的**训练和训练期验证**统一按 positive-only 数据处理，不增加负 prompt 监督分支。当前 SAM3 在 `eval()` forward 中不会生成 Hungarian matching 的 `indices`，所以训练期验证不调用依赖 matching 的原 SAM3 loss，而是计算具有直接 pair-to-mask 对应关系的 patch SoftCE 与 PMASS。当前六来源配置为 `meters: null`，不导出预测或计算 AP；旧 COCO 训练配置保留 bbox/mask prediction dumper 供观察趋势与回归，但它未 query 缺失类别，所得数值不是正式 COCO AP。两种训练期验证都保持一图一 query 的 pair 合约。
+
+标准 COCO bbox/segm AP 是另一件事：正式评估必须在每张图像上运行全部类别，否则缺失类别上的 false positive 永远不会进入评测，得到的指标会偏乐观。它已拆分到独立的 `coco2017_steersam_mask_eval.yaml`，使用专用 all-category-pair loader：
+
+```yaml
+coco_json_loader:
+  _target_: sam3.train.data.coco_json_loaders.COCOAllCategoryPairsFromJSON
+  _partial_: true
+```
+
+该 loader 内部固定为 `include_negatives=true, category_chunk_size=1`，同时保留原始 image/category ID，并为每个 `(image, category)` 分配稳定的 pair-level ID。正式配置仅使用原始 ID 计算标准 COCO bbox/mask AP，不生成 pair GT，也不调用 cgF1、IL_MCC 或 positive macro-F1。pair ID 和相关 helper 只保留给显式启用的可选诊断与测试，不能当作官方 COCO 表格指标。短程 smoke 和训练期 val 仍只检查 positive pair，不报告正式指标。
 
 对于当前 positive-pair loader，模型不需要通过 `images[img_ids]` 再复制一份 pair images；`img_batch` 本身已经是 pair batch。仅文本需要从 `U` 条去重结果 gather 到 `P` 条 pair：
 
@@ -653,6 +673,7 @@ class SteerableViT(ViT):
 - 原 `ViT` 不注册 adapter；只有 `SteerableViT` 注册 adapter；
 - `steering_layers` 必须是可配置集合，校验索引范围、顺序和重复项；
 - `steering_factor=0` 和 `alpha=0` 都应产生 baseline 等价输出。
+- `forward_with_patch_features` 在不改变普通 `forward` 返回协议的前提下，额外返回最终 `P x 1024 x 48 x 48` pre-FPN feature，供 patch head 使用。
 
 ### 7.4 正确处理 attention mask
 
@@ -695,6 +716,7 @@ def forward(
     steering_text: Tensor | None = None,
     steering_padding_mask: Tensor | None = None,
     steering_factor: float = 1.0,
+    return_patch_features: bool = False,
 ):
     features = self.trunk(
         sample,
@@ -716,7 +738,7 @@ def forward(
 **计划修改**：
 
 - 新增 `SteerSAMVLBackbone(SAM3VLBackbone)`；
-- `forward_text_for_steering` 返回 `language_contextual_pre_resizer: L x U x 1024`，同时保留 256 维 late-fusion features；
+- `forward_text_for_steering` 返回 `language_contextual: L x U x 1024`，同时保留 256 维 late-fusion features；
 - 新增显式 `forward_conditioned_image(...)`，接受 pair text/mask/factor；
 - 返回的 FPN feature shape 为 `P x 256 x {192,96,48}^2`；
 - `enable_steering=False` 时 builder 继续使用原 `SAM3VLBackbone`，不经过这些接口。
@@ -753,6 +775,28 @@ def validate_positive_pair_batch(images, img_ids, text_ids):
 - `img_ids == arange(P)` 断言，防止误用一图多 query 的 loader；
 - 空 prompt 和重复文本测试；数据 query 均来自有效的正 image-category records。
 
+### 7.7.1 新增 pre-FPN patch head 与 patch loss
+
+新增 [sam3/model/steersam_patch_head.py](../sam3/model/steersam_patch_head.py) 中的 `SteerSAMPatchHead`。它接收最终 prompt-aware ViT feature `P x 1024 x 48 x 48`，用 `Conv2d(1024,1,1)` 输出 `P x 48 x 48` logits；该卷积在数学上等价于对每个 patch 共享同一个 `Linear(1024,1)`。权重和 bias 默认置零，与 SteerViT 的 head 初始化一致。
+
+新增 [sam3/train/loss/steersam_patch_loss.py](../sam3/train/loss/steersam_patch_loss.py)：
+
+1. 按 `num_boxes` 将 packed instance masks 拆回每个 image-category pair；
+2. 忽略 `is_valid_mask=false` 的实例，并对同类别全部有效实例取 union；
+3. 用 `adaptive_avg_pool2d` 对齐实际 patch grid，得到每个 patch 的前景占比；
+4. 在空间维归一化为概率分布；
+5. 对 `P x 2304` logits 使用 soft cross-entropy，并记录 foreground probability mass（PMASS）。
+
+```text
+M_p = union of valid category-instance masks
+Y_p = AdaptiveAvgPool(M_p, 48 x 48)
+T_p = Y_p / sum(Y_p)
+L_patch = -sum(T_p * log_softmax(S_p))
+L_total = L_SAM3 + lambda_patch * L_patch
+```
+
+`SteerSAMPatchLossWrapper` 在训练时组合原 SAM3 loss 与 patch loss；验证时将 `task_loss=null`，从而无需 Hungarian `indices` 也能报告真实 patch loss/PMASS。patch feature 不得 `detach`，否则该目标只能训练线性 head，不能训练 steering adapter。
+
 ### 7.8 修改 `sam3/model_builder.py`
 
 **当前代码在做什么**：构造 ViT、FPN、text encoder、fusion encoder、decoder 和 mask head；当前冻结配置还可对整个 vision/language backbone 设置 `requires_grad_(False)`。
@@ -768,8 +812,12 @@ steering_num_heads: int = 16
 steering_head_dim: int = 64
 steering_dropout: float = 0.0
 steering_factor: float = 1.0
-freeze_pretrained_vision: bool = True
-freeze_pretrained_language: bool = True
+enable_patch_supervision: bool = False
+patch_head_zero_init: bool = True
+freeze_vision_backbone: bool = True
+freeze_vision_fpn: bool = True
+freeze_language_backbone: bool = True
+freeze_sam3_task_modules: bool = False
 ```
 
 构建分支应近似为：
@@ -787,13 +835,15 @@ return build_steersam_image_components(...)
 
 1. 构建完整模型（包括 adapters）；
 2. 加载 SAM3 预训练 checkpoint，允许 adapter keys 缺失并单独记录；
-3. 冻结预训练 vision/language 参数；
-4. 显式将 `steering_adapters.parameters()` 设为 `requires_grad=True`；
-5. 统计并打印 trainable/frozen 参数名和数量。
+3. 冻结预训练 vision/language 参数；策略二配置以
+   `freeze_vision_backbone=true, freeze_vision_fpn=false` 冻结 ViT trunk、训练 FPN；
+4. 通过 `freeze_sam3_task_modules=true` 冻结 geometry encoder、fusion encoder/decoder、检测/评分头和 segmentation head；
+5. 显式将 `steering_adapters.parameters()` 设为 `requires_grad=True`，patch head 保持可训练；
+6. 统计并打印 trainable/frozen 参数名和数量。
 
 不建议把整个 vision forward 放进 `torch.no_grad()`：adapter 位于 trunk 内部，这会切断 adapter 的 autograd graph。只把原参数设为 `requires_grad=False` 即可节省这些参数的梯度和优化器状态；若未来要对 adapter 之前的连续 frozen prefix 使用 `no_grad`，必须按计算图分段实现并单独验证。
 
-另一个细节是 module mode。调用顶层 `model.train()` 会递归把冻结 backbone 设为 train mode，drop-path 等随机行为仍可能启用。可增加一个 helper，在训练开始后让冻结的基础 block 保持 eval，同时只让 adapter 和任务头保持 train。是否保留 drop-path 应作为明确配置，而不是冻结后的偶然副作用。
+另一个细节是 module mode。调用顶层 `model.train()` 会递归把冻结模块设为 train mode，drop-path/dropout 等随机行为仍可能启用。当前 helper 会在训练开始后让所有全冻结子树保持 eval，同时让 adapter、patch head 与 FPN 保持 train。
 
 `build_sam3_video_model` 不增加 steering 参数、不修改构建流程，也不纳入本项目测试范围。
 
@@ -813,7 +863,7 @@ trainable = {
 
 - 删除 SteerSAM 配置中冻结 backbone 的零 LR 参数组；
 - 为 `steering_adapters` 建独立 LR/weight-decay 组；
-- 其余非 backbone 模块沿用微调 LR；
+- FPN 沿用保守的预训练模块微调 LR；post-FPN task stack 不进入 optimizer；
 - `alpha` gate 通常设 `weight_decay=0`；
 - 在创建 optimizer 后断言每个 trainable 参数恰好出现一次；
 - 记录 adapter、head、其他模块各自的参数量。
@@ -834,13 +884,17 @@ sam3/train/configs/coco/coco2017_steersam_mask.yaml
 # 示意字段；最终键名应与完成后的 builder/Hydra 接口一致
 model:
   enable_steering: true
+  enable_patch_supervision: true
+  patch_head_zero_init: true
   resolution: 672
   steering_layers: [7, 15, 23, 31]
   steering_num_heads: 16
   steering_head_dim: 64
   steering_factor: 1.0
-  freeze_pretrained_vision: true
-  freeze_pretrained_language: true
+  freeze_vision_backbone: true
+  freeze_vision_fpn: false
+  freeze_language_backbone: true
+  freeze_sam3_task_modules: true
 
 data:
   train:
@@ -854,10 +908,20 @@ data:
 
 optimizer:
   # 只为 requires_grad=True 参数建组
-  # adapter 和 alpha 使用显式 pattern，且不能与 broad backbone rule 重叠
+  # adapter、alpha 和 steering_patch_head 使用显式 pattern，且不能与 broad backbone rule 重叠
 ```
 
-`COCOPositivePairFromJSON` 是 SteerSAM image pipeline 的默认 positive-only 数据合约，也已用于当前 frozen-backbone baseline。它在 API 上不接受 `include_negatives` 和 `category_chunk_size`；所以新增 COCO/LVIS 适配时，应继承“直接索引正 pair”的合约，而不是重新暴露这两个开关。SteerSAM 配置不应盲目继承 baseline 的 physical batch size；应先测量 adapter 开启后的峰值显存和吞吐，再确定 physical batch size，并通过 gradient accumulation 对齐 effective batch。
+`COCOPositivePairFromJSON` 是 COCO 历史实验和 frozen-backbone baseline 的 positive-only loader；六数据集主入口使用 `UnifiedPositivePairFromSQLite`。两者都保持“直接索引正 pair”的合约，不重新暴露 `include_negatives` 和 `category_chunk_size`。SteerSAM 配置不应盲目继承 baseline 的 physical batch size；应先测量 adapter 开启后的峰值显存和吞吐。若以后需要 gradient accumulation，必须同时改用能返回 micro-batch list 的 chunking collator，并单独校准 loss/学习率尺度，不能只把 trainer 的 accumulation 数值调大。
+
+正式指标使用独立配置：
+
+```text
+sam3/train/configs/coco/coco2017_steersam_mask_eval.yaml
+```
+
+它以 `mode: val` 加载训练 checkpoint，使用 `COCOAllCategoryPairsFromJSON` 穷举 5,000 x 80 个 pair，只按原始 COCO image/category ID 输出 bbox AP、mask AP。`max_images` 在展开类别前限制源图数量；小样本仅用于 smoke，不声称复现官方全量指标。
+
+标准 COCO prediction dumper 使用在线 top-100 heap，使内存随源图像数而不是 400,000 个 pair 的全部 decoder 输出增长。COCO prompt-pair cgF1 辅助函数只保留作可选诊断和单元测试，不再被正式配置调用；LVIS 虚拟 pair 评测实现已经退出。
 
 上述是独立 SteerSAM 实验配置，因此显式开启 steering。公共 image builder 的代码默认值和原 SAM3/基线配置仍必须是 `enable_steering: false`。不要在原基线 YAML 中隐式打开该功能。
 
@@ -867,20 +931,21 @@ SteerSAM 从普通 SAM3 checkpoint 启动时，adapter 参数不存在是预期�
 
 - 先构造含 adapter 的模型；
 - 用 `strict=False` 加载；
-- 允许 missing keys 只来自 `steering_adapters.*`；
-- unexpected keys 和其他 missing keys 仍应报错或强警告；
+- 允许 missing keys 来自 `steering_adapters.*`、显式启用时的 `steering_patch_head.*`，以及加载前主动跳过并按当前分辨率重建的 `*.freqs_cis`；
+- released checkpoint 中 image-only 模型未构造的 `backbone.vision_backbone.sam2_convs.*` 可作为显式 unexpected-key 白名单；当且仅当构建参数关闭 segmentation head 时，`segmentation_head.*` 也属于合法 extra key；其余 unexpected keys 和 missing keys 必须报错；
 - adapter gate 为零，因此加载后的 baseline parity 可测试；
-- 训练 checkpoint 应保存 adapter 与非 backbone heads 的状态，并支持完整 resume。
+- 训练 checkpoint 当前保存完整 model state（包括冻结 task stack）以及 adapter、patch head、FPN 的 optimizer state，并支持完整 resume；独立 eval loader 同时支持 released `detector.*` checkpoint 和 Trainer 保存的直接 model state-dict key。
 
-### 7.12 建议新增测试
+### 7.12 已实现测试与新增接口覆盖
 
-仓库当前没有固定的顶层 `tests/` 结构时，可建立：
+仓库已有顶层 `tests/`，核心模块测试结构为：
 
 ```text
 tests/model/test_steering.py
 tests/model/test_text_encoder_outputs.py
 tests/model/test_steering_pair_mapping.py
 tests/train/test_trainable_param_groups.py
+tests/train/test_steersam_patch_loss.py
 ```
 
 最低测试矩阵：
@@ -891,11 +956,12 @@ tests/train/test_trainable_param_groups.py
 | zero-gate parity | `alpha=0` 时输出逐元素等于输入 |
 | mask invariance | 改变 padding token 的值不改变输出 |
 | nonzero prompt sensitivity | gate 非零时，不同文本可产生不同视觉输出 |
-| gradient test | frozen backbone 无 grad；adapter/gate 和任务头有 grad |
+| gradient test | frozen backbone 与 post-FPN task stack 无参数 grad；adapter/gate、patch head 和 FPN 有 grad |
 | pair mapping | 重复图像、重复文本、交叉 `img_ids/text_ids` 映射正确 |
 | optimizer coverage | 每个 trainable 参数出现一次，frozen 参数出现零次 |
 | checkpoint test | 普通 SAM3 -> SteerSAM 只缺 adapter keys；resume 无缺失 |
 | baseline integration | `enable_steering=False` 保持原输出结构和 shape |
+| patch target/loss | 多实例 union、无效 mask 跳过、SoftCE/PMASS 数值与梯度正确 |
 
 所有这些都可先用小 tensor 或缩小版 ViT 在 CPU 上完成，不要求 GPU。
 
@@ -913,17 +979,23 @@ tests/train/test_trainable_param_groups.py
   text token embedding
   24 层 text transformer
   text resizer 1024 -> 256
+  geometry encoder
+  fusion encoder
+  decoder 与 box / class / presence heads
+  dot-product scoring
+  segmentation head
 
 训练：
   新增 steering adapters + alpha gates
-  fusion encoder
-  decoder
-  box / class / presence heads
-  segmentation head
-  其他明确属于任务侧而非 backbone 的模块
+  新增 pre-FPN steering patch head
+  SimpleFPN
 ```
 
-需要根据实验目的决定 FPN 是否训练。本文推荐第一版训练 FPN，因为它连接被 steering 改变的 1024 维主干输出和原 256 维检测空间；若显存或过拟合明显，再增加“FPN frozen”消融。
+策略二配置明确设置 `freeze_vision_fpn=false`：冻结 ViT trunk，但训练连接 steered 1024 维输出与原 256 维检测空间的 FPN；同时设置 `freeze_sam3_task_modules=true`，把所有 post-FPN 预训练模块作为固定 readout。`freeze_vision_fpn=true` 保留为严格 SteerViT-style 消融；两个冻结参数的 builder 默认值仍保持兼容旧调用，其中新增的 task-stack 开关默认关闭。
+
+精确参数量为：总参数 `857,296,187`；策略二训练 `24,588,549`（2.87%），其中 adapters `16,785,412`、FPN `7,802,112`、patch head `1,025`。相比原先同时训练整个任务栈的 `57,333,819`，策略二少训练 `32,745,270` 个预训练参数。
+
+历史 672 分辨率双 A100 40GB smoke 曾验证每卡 physical batch `16`：训练峰值约 `21 GB/卡`、验证约 `8 GB/卡`；这些数值不是当前训练配置或 1008 分辨率的显存保证。实际 resolution、batch 与样本上限以实验 YAML 和保存的配置快照为准，改变后需重新测量。当前 trainer 只有在 collator 返回 micro-batch list 时才支持累积步数大于 1，标准 `collate_fn_api` 返回单个字典，因此当前配置必须保持 `gradient_accumulation_steps=1`，不能只修改 accumulation 数值。
 
 `requires_grad=False` 带来的主要节省是：
 
@@ -937,9 +1009,9 @@ tests/train/test_trainable_param_groups.py
 
 ## 9. 训练目标与实验设计
 
-### 9.1 第一阶段：直接使用 SAM3 原有损失
+### 9.1 联合任务目标
 
-第一版不增加 SteerViT patch head，直接用 SAM3 当前的：
+当前主方案同时使用 SAM3 原有任务损失与 SteerViT 风格的 patch localization loss。SAM3 部分包括：
 
 - 分类/匹配相关损失；
 - box regression 与 GIoU 等定位损失；
@@ -947,11 +1019,7 @@ tests/train/test_trainable_param_groups.py
 - instance mask；
 - semantic mask（若配置启用）。
 
-只要 adapter 在预测路径中且 gate 开启，这些损失会把梯度传回 steering adapter。这样可以先回答最核心的问题：在相同任务监督下，early steering 是否比“冻结 backbone、只训练后端”更好。
-
-### 9.2 可选第二阶段：辅助 patch steering loss
-
-如果发现 gate 长期接近零或视觉 prompt sensitivity 不明显，可增加一个训练期辅助头：
+这些任务损失继续负责最终 instance detection/segmentation。与此同时，patch 分支提供更靠近 steering 发生位置的直接空间监督：
 
 ```text
 steered 48x48 tokens -> Linear(1024,1) -> P x 2304 logits
@@ -962,39 +1030,42 @@ loss = soft cross-entropy
 总损失：
 
 ```text
-L_total = L_SAM3 + lambda_steer * L_patch
+L_total = L_SAM3 + lambda_patch * L_patch
 ```
 
-这更接近 SteerViT 的训练信号，但必须作为独立消融。当前数据合约只保留有效正 image-category pairs，因此辅助目标直接由对应正类别 mask 构造。
+当前配置以 `lambda_patch=0.1` 作为保守起点。patch head 位于 FPN 之前，所以该项直接训练 patch head 和 steering adapters；原 ViT 参数冻结但保持可微，FPN/decoder 不在这条辅助路径中。当前数据合约只保留有效正 image-category pairs，目标直接由对应类别全部有效实例 mask 的并集构造，非目标 patch 作为空间负例，不需要额外构造 negative prompt。
 
-### 9.3 必做消融
+该设计的核心叙事是：语言先在 ViT 内决定“应该突出哪些 patch”，patch loss 保证这种改变具有空间语义，FPN 再把 prompt-aware 表示传播到检测和分割所需的多尺度，最终由 SAM3 原任务头产生 boxes 与 masks。
 
-至少比较：
+### 9.2 后续实验（不属于架构成立的前置条件）
 
-| 实验 | Backbone | Adapter | 后端模块 | 目的 |
-|---|---|---|---|---|
-| A | frozen | 无 | train | 当前 frozen-backbone 基线 |
-| B | frozen | train | train | SteerSAM 主方案 |
-| C | frozen | train | frozen/最小训练 | 检查提升是否真正来自 adapter |
-| D | full fine-tune | 无 | train | 与普通全量微调比较上限和成本 |
-| E | frozen | gate 固定 0 | train | 检查结构/数据管线改动自身影响 |
+架构实现稳定后，可按需要比较：
 
-再分别消融：
+| 实验 | ViT / text | Adapter + patch | FPN | Post-FPN task stack | 目的 |
+|---|---|---|---|---|---|
+| A | frozen | 无 | train | frozen | 与策略二严格匹配的无 steering 基线 |
+| B | frozen | train | frozen | frozen | SteerViT-style 严格新增模块训练 |
+| C | frozen | train | train | frozen | **策略二主方案**：允许条件视觉接口适配 |
+| D | frozen | train | train | train | 下游完整适配的性能上限 |
+| E | train | 无 | train | train | 普通 full fine-tune 的成本/性能上限 |
+
+可进一步考察：
 
 - 注入层 `[31]`、`[15,31]`、`[7,15,23,31]`、`[3,7,...,31]`、`[1,3,...,31]`，并同时报告参数量和吞吐；
 - contextual 1024、raw embedding 1024、resized 256 后投影；
 - connector 无/Linear/两层 MLP；
 - `steering_factor`；
-- 原损失 vs 加辅助 patch loss；
+- patch loss 权重或关闭 patch supervision；
 - COCO 类别名 vs 更描述性的 referring-expression 数据。
 
-### 9.4 评估指标
+### 9.3 评估指标
 
 除 box AP、mask AP、semantic segmentation 指标外，应增加能直接衡量 steering 的诊断：
 
 - 对两个不同 prompt，vision token 差异和预测差异不能恒为零；
 - gate 值随层和训练步的变化；
 - `alpha=0` 的 baseline parity；
+- positive-pair validation 的 patch SoftCE 与 PMASS；
 - 每 step 峰值显存、吞吐和 trainable/optimizer-state 参数量。
 
 ---
@@ -1042,7 +1113,7 @@ L_total = L_SAM3 + lambda_steer * L_patch
 
 ### 阶段 5：训练与消融
 
-先做短程 overfit/smoke test，再做 COCO 主实验。不要一开始同时增加 connector、FFN、辅助 loss 和大量注入层，否则即使指标变化也无法定位原因。
+先验证联合 `SAM3 task loss + patch loss` 的短程训练、梯度和显存，再做 COCO 主实验。当前主方案不同时增加 connector、adapter FFN、pixel-level 辅助头或 image-level 对比头，保持“patch steering → 多尺度传播 → 原任务解码”的单一主线。
 
 ---
 
@@ -1056,7 +1127,8 @@ L_total = L_SAM3 + lambda_steer * L_patch
 | padding 改变预测 | mask 布尔语义反了 | 做 padding value invariance 测试 |
 | OOM | `P` 被 category chunk 放大；复制 672 图像过多 | 日志打印 `B_I,U,P`；限制 pair 数，必要时梯度累积 |
 | 性能低于 frozen baseline | steering 过强、数据提示过粗、后端 LR 不合适 | gate/layer/factor 和数据集消融 |
-| checkpoint missing keys 很多 | 构建参数或命名不一致 | 只白名单 `steering_adapters.*` missing keys |
+| checkpoint missing keys 很多 | 构建参数或命名不一致 | 只白名单 `steering_adapters.*`、启用时的 `steering_patch_head.*` 和主动跳过的 `*.freqs_cis`；检查其他 missing/unexpected keys |
+| patch loss 不下降或 PMASS 不升 | target union/下采样错位；patch feature 被 detach；head 未进 optimizer | 检查 union mask、48x48 对齐、梯度和 param group |
 | 冻结后仍有随机波动 | frozen backbone 仍处于 train mode，drop-path 生效 | 明确设置 frozen base eval 并复测 |
 | 训练能跑但 pair 标签错位 | `img_ids/text_ids` gather 后未重置下游映射 | 构造可人工核对的 2 图3文本单测 |
 | 使用了错误的 1024 特征 | 把 `language_embeds` 当 contextual output | 比较变量来源，应来自 encoder 的 `text_memory` |
@@ -1069,16 +1141,17 @@ L_total = L_SAM3 + lambda_steer * L_patch
 
 1. `enable_steering=False` 时不改变原 SAM3 API 和输出 shape；
 2. adapter `alpha=0` 时，固定输入上的 backbone 输出与基线在数值容差内一致；
-3. vision/text 原参数均 `requires_grad=False`，adapter 和非 backbone 目标模块为 `True`；
+3. 策略二只有 adapter、patch head 和 FPN 为 `requires_grad=True`；ViT/text 原参数与完整 post-FPN task stack 均为 `False`；
 4. optimizer 中没有 frozen 参数，trainable 参数恰好出现一次；
 5. contextual 1024 token 确认来自 text encoder 输出，256 token 确认来自 resizer；
 6. pair batch 在重复图像、多 prompt、重复文本情况下映射正确；
 7. padding mask 测试通过，无 NaN；
 8. 普通 SAM3 checkpoint 可初始化 SteerSAM，SteerSAM checkpoint 可完整 resume；
 9. CPU 小模型测试全部通过；
-10. GPU 训练前给出预计 `P`、峰值显存保护和 micro-batch 策略；
-11. 至少完成 frozen baseline、SteerSAM、gate=0 三组可比实验；
-12. 文档中的 shape 与实际 forward assertion/log 一致。
+10. patch head 输出为 `P x 48 x 48`，类别多实例 union target、SoftCE、PMASS 和 patch-to-adapter 梯度均通过测试；
+11. GPU 训练前给出预计 `P`、峰值显存保护和 micro-batch 策略；
+12. 文档中的 shape 与实际 forward assertion/log 一致；
+13. 训练保持 positive-only；正式 COCO AP 验证覆盖每张图像的全部类别，截断 positive-only smoke 不报告 AP。
 
 其中第 1 项必须通过关闭开关后走原 `Sam3Image`/`ViT` 类来验证，不能只用 `alpha=0` 代替。还应单独断言 672 输入对应 `48 x 48` trunk grid、`{192,96,48}` 保留 FPN 尺度和 `2304` 个 fusion tokens。
 
@@ -1094,6 +1167,7 @@ contextual 1024-d language tokens
         | early steering          | frozen resizer 1024 -> 256
         v                         v
 prompt-aware vision trunk    existing late fusion + decoder
+        |-- patch localization    |
         |                         |
         `---------- FPN ----------'
                      |
@@ -1104,11 +1178,11 @@ prompt-aware vision trunk    existing late fusion + decoder
 
 1. 取对文本特征——必须是 encoder 后、resizer 前的 contextual 1024 token；
 2. 处理好 pair batch——early steering 后视觉特征不能跨 prompt 无条件复用；
-3. 冻结正确——冻结原主干，但不能冻结新 adapter，也不能让 optimizer 的 broad rule 吞掉 adapter；
+3. 冻结正确——冻结原主干和 post-FPN task stack，但不能冻结新 adapter、patch head 与 FPN，也不能让 optimizer 的 broad rule 吞掉它们；
 4. 保持可回退——零 gate、关闭开关和旧 API 都应保持 baseline；
-5. 用消融证明价值——尤其要区分 early steering 的真实收益与训练参数量/数据管线变化。
+5. 增加直接空间监督——在 FPN 前约束 prompt-aware patch，同时保留原 SAM3 最终任务目标。
 
-按本文的阶段顺序实施，可以先以最小风险得到一个可验证的 image-only SteerSAM v1，再通过消融决定是否加入更多注入层、connector、辅助 patch loss 或 prompt micro-batching。
+当前 image-only SteerSAM 因而形成完整故事：语言在 ViT 内改变 patch 表示，patch loss 保证这种改变指向对应类别区域，可训练 FPN 将其适配并传播到三个尺度，冻结的原 SAM3 heads 作为固定 readout 将其转化为检测和分割结果。这样最终任务损失无法通过重新训练 late-fusion/decoder/segmentation heads 绕开 steering 前端。image-level、pixel-level 辅助分支以及更多 adapter/connector 留作后续扩展，不进入当前核心方案。
 
 ## 参考资料
 
