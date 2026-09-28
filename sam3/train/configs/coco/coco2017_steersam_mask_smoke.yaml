@@ -3,16 +3,32 @@ defaults:
   - _self_
 
 # ============================================================================
-# Paths Configuration
+# SHORT SMOKE RUN of coco2017_steersam_mask.yaml (32 train/32 val pairs, 1 epoch,
+# /tmp log dir) for GPU sanity checks; not a real experiment config.
+# ============================================================================
+# SteerSAM patch-supervision smoke config (steersam_design.md sections 7.10 and 9).
+#
+# Differences from coco2017_full_ft_mask_frozen_backbone.yaml:
+# - model.enable_steering: true -> SteerableViT/SteerSAM* classes, text-first
+#   positive-pair forward with zero-gated cross-attention adapters at ViT
+#   blocks 7/15/23/31.
+# - Strategy 2 freezes the pretrained ViT trunk, full language backbone, and
+#   post-FPN SAM3 task stack. The builder re-enables steering adapters, while
+#   the FPN and patch head stay trainable as the conditioned visual front end.
+# - Optimizer param groups only cover trainable params (the trainer passes a
+#   trainable-only allowlist for steering models), so the frozen backbones'
+#   zero-LR groups are REMOVED and the adapters get their own lr group.
+#   A weight-decay-0 rule covers the tanh(alpha) gates.
 # ============================================================================
 paths:
-  coco_root: /home/chenshengbo/workspace/sam3/data/coco_mini
-  experiment_log_dir: /home/chenshengbo/workspace/sam3/outputs/coco2017mini_full_ft_mask
+  coco_root: /home/chenshengbo/workspace/sam3/data/coco
+  experiment_log_dir: /tmp/steersam_strategy2_b16_smoke_20260925
   bpe_path: /home/chenshengbo/workspace/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
-  checkpoint_path: /home/chenshengbo/workspace/sam3/pretrained_weights/sam3/sam3_cleaned.pt
+  checkpoint_path: /home/chenshengbo/workspace/sam3/pretrained_weights/sam3/sam3.pt
 # COCO 2017 dataset configuration
 coco_train:
-  num_images: null # null uses the complete COCO train2017 split.
+  # Smoke test: enough pairs to exercise several optimizer steps on 2 GPUs.
+  num_images: 32
 
   # Training transforms pipeline
   train_transforms:
@@ -167,7 +183,7 @@ scratch:
   scale_by_find_batch_size: True
 
   # Image processing parameters
-  resolution: 1008
+  resolution: 672
   consistent_transform: False
   max_ann_per_img: 200
 
@@ -186,18 +202,28 @@ scratch:
   context_length: 2
   gather_pred_via_filesys: false
 
-  # Learning rate and scheduler parameters
+  # Learning rate and scheduler parameters.
+  # The pretrained FPN uses a conservative fine-tuning learning rate.
   lr_scale: 0.01
-  lr_transformer: ${times:8e-4,${scratch.lr_scale}}
-  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
-  lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
-  lrd_vision_backbone: 0.9
+  lr_fpn: ${times:8e-4,${scratch.lr_scale}}
+  # The steering adapters start from random init, so they need a higher LR
+  # than the pretrained heads. SteerViT used 3e-4; 1e-4 with the shared
+  # warmup/cooldown is the ablation starting point (steersam_design.md 7.9).
+  lr_steer_adapter: 1e-4
   wd: 0.1
-  scheduler_timescale: 5000
-  scheduler_warmup: 1000
+  scheduler_timescale: 20
+  scheduler_warmup: 20
   scheduler_cooldown: 20
 
-  val_batch_size: 1
+  # Steering adapter settings (mirrored in model params below).
+  steering_layers: [7, 15, 23, 31]
+  enable_patch_supervision: true
+  patch_loss_weight: 0.1
+
+# NOTE: steering inside the vision trunk requires re-measuring peak memory
+# before raising batch size. Keep accumulation=1 with the standard collator;
+# gradient accumulation requires a collator returning micro-batch lists.
+  val_batch_size: 16
   collate_fn_val:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -206,7 +232,7 @@ scratch:
     with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
 
   gradient_accumulation_steps: 1
-  train_batch_size: 1
+  train_batch_size: 16
   collate_fn:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -222,8 +248,8 @@ trainer:
   _target_: sam3.train.trainer.Trainer
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
-  skip_first_val: false
-  max_epochs: 100
+  skip_first_val: True
+  max_epochs: 1
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 1
@@ -236,9 +262,14 @@ trainer:
     gradient_as_bucket_view: True
 
   loss:
-    all: ${coco_train.loss}
+    all:
+      _target_: sam3.train.loss.steersam_patch_loss.SteerSAMPatchLossWrapper
+      task_loss: ${coco_train.loss}
+      patch_loss_weight: ${scratch.patch_loss_weight}
     default:
-      _target_: sam3.train.loss.sam3_loss.DummyLoss
+      _target_: sam3.train.loss.steersam_patch_loss.SteerSAMPatchLossWrapper
+      task_loss: null
+      patch_loss_weight: ${scratch.patch_loss_weight}
 
   data:
     train:
@@ -247,9 +278,7 @@ trainer:
         _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
         limit_ids: ${coco_train.num_images}
         coco_json_loader:
-          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
-          include_negatives: true
-          category_chunk_size: 27 # Mask training uses more memory than bbox-only training.
+          _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
           _partial_: true
         transforms: ${coco_train.train_transforms}
         load_segmentation: ${scratch.enable_segmentation}
@@ -273,11 +302,12 @@ trainer:
       _target_: sam3.train.data.torch_dataset.TorchDataset
       dataset:
         _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        # Smoke validation is deliberately a 32-positive-pair plumbing
+        # check. It is not a complete all-category COCO AP evaluation.
+        limit_ids: 32
         load_segmentation: ${scratch.enable_segmentation}
         coco_json_loader:
-          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
-          include_negatives: true
-          category_chunk_size: 27 # One validation datapoint per image; reduce if validation OOMs.
+          _target_: sam3.train.data.coco_json_loaders.COCOPositivePairFromJSON
           _partial_: true
         img_folder: ${paths.coco_root}/val2017
         ann_file: ${paths.coco_root}/annotations/instances_val2017.json
@@ -300,37 +330,29 @@ trainer:
     load_from_HF: false
     device: cpus
     eval_mode: false
+    resolution: ${scratch.resolution}
     enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
+    # Strategy 2: train only adapters, patch head, and FPN. The pretrained
+    # ViT/text towers and the complete post-FPN SAM3 task stack are fixed.
+    enable_steering: true
+    steering_layers: ${scratch.steering_layers}
+    steering_num_heads: 16
+    steering_head_dim: 64
+    steering_dropout: 0.0
+    steering_factor: 1.0
+    enable_patch_supervision: ${scratch.enable_patch_supervision}
+    patch_head_zero_init: true
+    frozen_pretrained_eval: true
+    freeze_vision_backbone: true
+    freeze_vision_fpn: false
+    freeze_language_backbone: true
+    freeze_sam3_task_modules: true
 
   meters:
     val:
-      coco2017:
-        segmentation:
-          _target_: sam3.eval.coco_writer.PredictionDumper
-          iou_type: "segm"
-          dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017_mask
-          merge_predictions: True
-          postprocessor: ${scratch.original_mask_postprocessor}
-          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
-          maxdets: 100
-          pred_file_evaluators:
-            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
-              gt_path: ${paths.coco_root}/annotations/instances_val2017.json
-              tide: False
-              iou_type: "segm"
-        detection:
-          _target_: sam3.eval.coco_writer.PredictionDumper
-          iou_type: "bbox"
-          dump_dir: ${launcher.experiment_log_dir}/dumps/coco2017
-          merge_predictions: True
-          postprocessor: ${scratch.original_box_postprocessor}
-          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
-          maxdets: 100
-          pred_file_evaluators:
-            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
-              gt_path: ${paths.coco_root}/annotations/instances_val2017.json
-              tide: False
-              iou_type: "bbox"
+      # A truncated positive-only subset cannot produce standard COCO AP.
+      # Keep the val loop for forward/loss plumbing, but do not dump or score it.
+      coco2017: null
 
   optim:
     amp:
@@ -345,39 +367,28 @@ trainer:
       max_norm: 0.1
       norm_type: 2
 
-    param_group_modifiers:
-      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
-        _partial_: True
-        layer_decay_value: ${scratch.lrd_vision_backbone}
-        apply_to: "backbone.vision_backbone.trunk"
-        overrides:
-          - pattern: "*pos_embed*"
-            value: 1.0
+    # The trainer passes a trainable-only param allowlist for steering models,
+    # so the frozen backbones' zero-LR groups from the baseline config are
+    # intentionally absent here: they would match no trainable parameter.
+    param_group_modifiers: []
 
     options:
       lr:
-        - scheduler: # transformer and class_embed
+        - scheduler: # trainable FPN (all post-FPN SAM3 task modules are frozen)
             _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_transformer}
+            base_lr: ${scratch.lr_fpn}
             timescale: ${scratch.scheduler_timescale}
             warmup_steps: ${scratch.scheduler_warmup}
             cooldown_steps: ${scratch.scheduler_cooldown}
-        - scheduler:
+        - scheduler: # steering adapters, gates, and pre-FPN patch head
             _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_vision_backbone}
-            timescale: ${scratch.scheduler_timescale}
-            warmup_steps: ${scratch.scheduler_warmup}
-            cooldown_steps: ${scratch.scheduler_cooldown}
-          param_names:
-            - "backbone.vision_backbone.*"
-        - scheduler:
-            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_language_backbone}
+            base_lr: ${scratch.lr_steer_adapter}
             timescale: ${scratch.scheduler_timescale}
             warmup_steps: ${scratch.scheduler_warmup}
             cooldown_steps: ${scratch.scheduler_cooldown}
           param_names:
-            - "backbone.language_backbone.*"
+            - "*steering_adapters*"
+            - "*steering_patch_head*"
 
       weight_decay:
         - scheduler:
@@ -389,6 +400,11 @@ trainer:
           param_names:
             - "*bias*"
           module_cls_names: ["torch.nn.LayerNorm"]
+        - scheduler: # never decay the zero-initialized gates toward zero output
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - "*steering_adapters*.alpha"
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints

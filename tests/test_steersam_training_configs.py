@@ -76,3 +76,30 @@ def test_internal_validation_configs_still_resolve(source):
         f"{cfg.launcher.experiment_log_dir}/checkpoints/checkpoint.pt"
     )
     assert cfg.trainer.meters is None
+
+
+@pytest.mark.parametrize("name", [
+    "coco2017mini_full_ft_mask_frozen_backbone",
+    "coco2017_steersam_mask_smoke",
+])
+def test_legacy_coco_configs_resolve_without_changing_pair_contract(name):
+    cfg = load_training_config(CONFIG_ROOT.parent / "coco" / f"{name}.yaml")
+    _check_targets(cfg)
+    assert cfg.trainer.gradient_accumulation_steps == 1
+    assert cfg.trainer.model.freeze_vision_backbone
+    assert cfg.trainer.model.freeze_language_backbone
+    for split in ("train", "val"):
+        assert cfg.trainer.data[split].dataset.coco_json_loader._target_.endswith(
+            "COCOPositivePairFromJSON"
+        )
+    if name.endswith("smoke"):
+        assert cfg.coco_train.num_images == 32
+        assert cfg.trainer.data.val.dataset.limit_ids == 32
+        assert cfg.trainer.max_epochs == 1
+        assert cfg.trainer.model.enable_steering
+        assert cfg.trainer.model.freeze_sam3_task_modules
+        assert not cfg.trainer.model.freeze_vision_fpn
+        assert cfg.trainer.meters.val.coco2017 is None
+    else:
+        assert not cfg.trainer.model.get("enable_steering", False)
+        assert not cfg.trainer.model.get("freeze_sam3_task_modules", False)
